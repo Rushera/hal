@@ -1,0 +1,32 @@
+# hal configuration preset matching a Hermes install that uses the
+# opencode-go gateway with deepseek-v4.1-flash.
+#
+# Use it explicitly, or copy it to $XDG_CONFIG_HOME/hal/config.toml:
+#
+#     hal --config examples/config.opencode-go.toml -p "hello"
+#
+# The gateway speaks the OpenAI chat-completions protocol, so hal's bundled
+# provider works unchanged; `provider` stays "openai" (the protocol), while the
+# base_url selects the service.
+
+provider = "openai"
+
+model = "deepseek-v4.1-flash"
+
+base_url = "https://opencode.ai/zen/go/v1"
+
+# Name the environment variable holding the credential rather than pasting the
+# secret into this file. hal checks it before HAL_API_KEY / OPENAI_API_KEY.
+api_key = ""
+api_key_env = "OPENCODE_GO_API_KEY"
+
+tools     = "read,bash,edit,write,grep,find,ls"
+max_turns = 90
+
+append_system_prompt = ""
+
+session_dir = ""
+name        = ""
+
+no_session       = false
+no_context_files = false

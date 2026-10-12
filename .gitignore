@@ -1,0 +1,29 @@
+# Build output
+/hal
+/hal.exe
+/dist/
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Go workspace / vendor (not used, but avoid accidental commits)
+go.work
+go.work.sum
+
+# Editor and IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Local runtime state (never commit credentials or session logs)
+*.local.toml
+*.local.json
+.env
+.env.*

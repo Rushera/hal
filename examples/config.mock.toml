@@ -1,0 +1,32 @@
+# hal configuration preset for a local mock/OpenAI-compatible endpoint.
+#
+# Use it when you want to point hal at a stub server (or a local model server)
+# without touching your real configuration:
+#
+#     hal --config examples/config.mock.toml -p "smoke test"
+#
+# Note that a config file passed with --config is authoritative for defaults, but
+# individual flags still override it.
+
+provider = "openai"
+model    = "mock-model"
+
+# A stub server that speaks the OpenAI chat-completions protocol with streaming.
+base_url = "http://127.0.0.1:8792/v1"
+
+# Local stub servers usually ignore the key, but hal sends it when present.
+api_key = "mock-key"
+
+# Keep the mock honest: fewer turns, and only the tools a test needs.
+tools     = "read,write,edit,bash,grep,find,ls"
+max_turns = 8
+
+append_system_prompt = "You are talking to a local mock endpoint used for smoke tests."
+
+# Keep mock runs out of the real session store so they do not pollute `-c`:
+session_dir = "~/.local/share/hal/mock-sessions"
+
+name = "mock smoke test"
+
+no_session       = false
+no_context_files = false

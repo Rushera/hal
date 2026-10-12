@@ -1,0 +1,71 @@
+# hal configuration — every available key, fully populated.
+#
+# Location: $XDG_CONFIG_HOME/hal/config.toml   (default ~/.config/hal/config.toml)
+# JSON is also accepted as config.json in the same directory; TOML wins if both exist.
+#
+# Precedence per setting: command-line flag > environment variable > this file > default.
+# See what actually applies, and where it came from, with:
+#
+#     hal --show-config
+
+# --- provider ---------------------------------------------------------------
+
+# Accepted for forward compatibility; only "openai" is bundled.
+provider = "openai"
+
+# Any model id your endpoint understands. Default: gpt-4o-mini
+model = "gpt-4o-mini"
+
+# Any OpenAI-compatible /chat/completions endpoint:
+#   OpenAI      https://api.openai.com/v1
+#   OpenRouter  https://openrouter.ai/api/v1
+#   Groq        https://api.groq.com/openai/v1
+#   Ollama      http://127.0.0.1:11434/v1
+#   llama.cpp   http://127.0.0.1:8080/v1
+#   vLLM        http://127.0.0.1:8000/v1
+base_url = "https://api.openai.com/v1"
+
+# Leave empty and export HAL_API_KEY (or OPENAI_API_KEY) instead, so credentials
+# stay out of dotfiles. If this file does hold a key, keep it mode 600: hal warns
+# when it is readable by other users.
+api_key = ""
+# Or name the environment variable holding the key, so the secret stays in one
+# place: api_key_env = "OPENCODE_GO_API_KEY"
+api_key_env = ""
+
+# --- tools and loop ---------------------------------------------------------
+
+# Comma-separated allowlist. Available: read, bash, edit, write, grep, find, ls.
+# For a read-only run, use "read,grep,find,ls".
+tools = "read,bash,edit,write,grep,find,ls"
+
+# Maximum model round trips per prompt before the run is stopped.
+max_turns = 32
+
+# --- prompting --------------------------------------------------------------
+
+# Replaces the default system prompt entirely. Either literal text, or the path to
+# a file that exists.
+system_prompt = ""
+
+# Appended after the default prompt and any AGENTS.md / CLAUDE.md context files.
+append_system_prompt = "Prefer small, focused changes and run the tests before finishing."
+
+# --- sessions ---------------------------------------------------------------
+
+# Overrides the session store. Default: $XDG_DATA_HOME/hal/sessions
+# A leading ~ is expanded.
+session_dir = ""
+
+# Names the request header carrying the per-conversation session id. Empty means
+# "auto": x-opencode-session is sent for opencode.ai endpoints, nothing for others.
+session_header = ""
+
+# Default session display name.
+name = ""
+
+# Save nothing to disk (ephemeral runs).
+no_session = false
+
+# Skip AGENTS.md / AGENTS.override.md / CLAUDE.md discovery.
+no_context_files = false

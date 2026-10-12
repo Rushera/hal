@@ -1,0 +1,16 @@
+{
+  "provider": "openai",
+  "model": "gpt-4o-mini",
+  "base_url": "https://api.openai.com/v1",
+  "api_key": "",
+  "api_key_env": "",
+  "tools": "read,bash,edit,write,grep,find,ls",
+  "max_turns": 32,
+  "system_prompt": "",
+  "append_system_prompt": "Prefer small, focused changes and run the tests before finishing.",
+  "session_dir": "",
+  "session_header": "",
+  "name": "",
+  "no_session": false,
+  "no_context_files": false
+}
