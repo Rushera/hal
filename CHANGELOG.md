@@ -6,6 +6,19 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The web console reuses its access token from
+  `$XDG_STATE_HOME/hal/web-token` (overridable with `--web-token` or
+  `$HAL_WEB_TOKEN`), so a restarted process keeps serving a page that is already
+  open: reload the tab instead of reopening the URL.
+- The console URL carries the session id. Loading a URL that names another
+  session reopens it, and the transcript is rebuilt from the stored conversation
+  — including tool calls and their output, marked with a `restored` note — so a
+  reload or a restart shows the whole conversation again. `hal --web -c` resumes
+  the latest session for the directory, which is what a rebuild-and-reload loop
+  wants.
+
 ## [0.1.0] - 2026-10-12
 
 First release.

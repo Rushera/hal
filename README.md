@@ -137,6 +137,7 @@ HAL_BASE_URL     / OPENAI_BASE_URL      endpoint (default https://api.openai.com
 HAL_MODEL        / OPENAI_MODEL         model (default gpt-4o-mini)
 HAL_CONFIG                              config file path
 HAL_SESSION_DIR                         session storage root
+HAL_WEB_TOKEN                           access token for --web
 XDG_CONFIG_HOME / XDG_DATA_HOME / XDG_STATE_HOME
 ```
 
@@ -148,7 +149,7 @@ variables are ignored, as the XDG specification requires.
 ```
 $XDG_CONFIG_HOME/hal/config.toml        (or config.json)   configuration
 $XDG_DATA_HOME/hal/sessions/                              session files
-$XDG_STATE_HOME/hal/                                      reserved
+$XDG_STATE_HOME/hal/web-token                             web console token (0600)
 ```
 
 ## Usage
@@ -161,6 +162,7 @@ cat main.go | hal -p "review this"   # pipe into a one-shot run
 hal -p @notes.md "extract the todos" # include a file
 hal --mode json "inspect this repo"  # JSONL event stream
 hal --web                            # browser console on 127.0.0.1:8080
+hal --web -c                         # web console continuing the latest session
 hal -c                               # resume the most recent session here
 hal --tools read,grep,find,ls -p "audit this repo"   # read-only run
 ```
@@ -174,13 +176,14 @@ stays on loopback unless you widen it.
 
 ```
 $ hal --web
-hal web console: http://127.0.0.1:8080/?token=b20e4552…
+hal web console: http://127.0.0.1:8080/?token=b20e4552…&session=67838d59…
 ```
 
-The URL carries a random token generated at startup; every request must present
-it. That is what keeps a page on another origin from reaching the API through
-your browser's loopback access, since the console can run shell commands. The
-page is served from the binary, so there is no build step and no extra files.
+The URL carries the access token and the session it was opened in. Every request
+must present the token, which is what keeps a page on another origin from
+reaching the API through your browser's loopback access, since the console can
+run shell commands. The page is served from the binary, so there is no build step
+and no extra files.
 
 `xterm`-free transcript: user turns, streamed assistant text, each tool call
 with its output and duration, errors, and a footer with model, status, token
@@ -189,6 +192,30 @@ TUI (`/help /model /new /session /tools /clear`); `enter` sends, `shift+enter`
 inserts a newline, `esc` aborts, and a prompt submitted while the agent is busy
 is queued. Server-sent events carry the stream; each reconnect resynchronises
 from a full snapshot, so a dropped connection never duplicates or loses blocks.
+
+#### Reloading, and surviving a restart
+
+The console is built to be reloaded while the agent keeps working:
+
+- **The token is persisted**, not regenerated per process. `--web` reuses the
+  token in `$XDG_STATE_HOME/hal/web-token` (mode `0600`), creating a random one
+  the first time, so a page that is already open keeps working after the process
+  is restarted — reload it and it reconnects to the new process. Override with
+  `--web-token` or `$HAL_WEB_TOKEN` (both are for development; a fixed token is
+  worth no more than its exposure).
+- **The session is in the URL.** Loading a URL whose `session` differs from the
+  current one reopens that stored session and rebuilds the transcript from it,
+  so a reload — or a tab left open across a restart — shows the whole
+  conversation again, marked with a `restored` note. `/new` rewrites the URL, so
+  the address bar always names the session the tab is showing.
+- **A restarted process starts a fresh session** unless you ask it not to, so
+  for a rebuild-and-reload loop run `hal --web -c`: it reattaches to the most
+  recent session for the directory, and an open tab then finds the same
+  conversation either way.
+
+Restoring the transcript reads the session's messages; tool output comes back
+whole, while per-call durations are not part of the session file and are lost
+across a restart.
 
 ### Editor and keys
 
@@ -244,8 +271,13 @@ commands. Use `--tools` to drop `bash`/`write`/`edit` for read-only work, and
 `--web-addr` to keep the console on loopback.
 
 The web console binds to `127.0.0.1` by default and authenticates every request
-with the random per-run token in its URL; widening `--web-addr` exposes an
-interface that can run shell commands, so put it behind your own access control.
+with the token in its URL; widening `--web-addr` exposes an interface that can
+run shell commands, so put it behind your own access control. The token is
+reused from `$XDG_STATE_HOME/hal/web-token` so a restarted process keeps serving
+pages that are already open — that file is as sensitive as the console itself
+(it is created mode `0600`), and `--web-token`/`$HAL_WEB_TOKEN` trade that
+convenience for a fixed, guessable value.
+
 Report vulnerabilities privately rather than in a public issue — see
 [SECURITY.md](SECURITY.md).
 
@@ -262,6 +294,11 @@ The suite runs the real agent loop against a scripted SSE server over loopback
 and executes the real tools against temp directories, so the tool-call round
 trip, error handling, session persistence, and the TUI's event handling are
 covered end to end.
+
+Rebuilding while the web console runs is the normal loop: `go build -o hal .`
+replaces the binary, and restarting the process leaves an open browser tab
+usable — reload it and the token, the session and the transcript all come back
+(see *Reloading, and surviving a restart* above).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the ground rules, and
 [CHANGELOG.md](CHANGELOG.md) for what changed in each release. Security issues

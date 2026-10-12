@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -26,6 +28,7 @@ type fakeAgent struct {
 	prompts  []string
 	aborted  bool
 	resets   int
+	history  []agent.Message
 }
 
 func (f *fakeAgent) RunPrompt(ctx context.Context, prompt string, emit func(agent.Event)) error {
@@ -62,9 +65,20 @@ func (f *fakeAgent) ModelName() string {
 }
 func (f *fakeAgent) SetModelName(m string) bool { f.mu.Lock(); f.model = m; f.mu.Unlock(); return true }
 func (f *fakeAgent) ProviderName() string       { return "fake" }
-func (f *fakeAgent) Messages() []agent.Message  { return nil }
 func (f *fakeAgent) Reset()                     { f.mu.Lock(); f.resets++; f.mu.Unlock() }
 func (f *fakeAgent) ToolNames() []string        { return []string{"read", "bash"} }
+
+func (f *fakeAgent) Messages() []agent.Message {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]agent.Message(nil), f.history...)
+}
+
+func (f *fakeAgent) setHistory(msgs ...agent.Message) {
+	f.mu.Lock()
+	f.history = msgs
+	f.mu.Unlock()
+}
 
 func (f *fakeAgent) promptCount() int {
 	f.mu.Lock()
@@ -532,5 +546,170 @@ func TestURLRewritesWildcardHost(t *testing.T) {
 		if !strings.HasSuffix(got, "?token="+srv.Token()) {
 			t.Fatalf("URL(%q) = %q, want the access token appended", tc.addr, got)
 		}
+	}
+}
+
+// ---- token persistence and session ownership -------------------------------
+
+func TestTokenFileIsCreatedAndReused(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "web-token")
+
+	first := New(Options{Agent: &fakeAgent{}, TokenFile: path})
+	if len(first.Token()) < 16 {
+		t.Fatalf("token = %q, want a generated token", first.Token())
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("token file was not written: %v", err)
+	}
+	if perm := st.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("token file mode = %04o, want 0600", perm)
+	}
+
+	// a second process reuses the stored token, which is what keeps an already
+	// open page working across a restart
+	second := New(Options{Agent: &fakeAgent{}, TokenFile: path})
+	if second.Token() != first.Token() {
+		t.Fatalf("token was not reused: %q then %q", first.Token(), second.Token())
+	}
+
+	// an explicit token wins over the file
+	third := New(Options{Agent: &fakeAgent{}, Token: "explicit-token", TokenFile: path})
+	if third.Token() != "explicit-token" {
+		t.Fatalf("explicit token = %q", third.Token())
+	}
+
+	// without a token file, every server gets a fresh token
+	random := New(Options{Agent: &fakeAgent{}})
+	if random.Token() == first.Token() {
+		t.Fatal("expected an independent in-memory token")
+	}
+}
+
+func TestURLCarriesTheSessionID(t *testing.T) {
+	srv := newTestServer(t, &fakeAgent{}, func(o *Options) {
+		o.SessionID = func() string { return "abcdef1234567890" }
+	})
+	got := srv.URL("0.0.0.0:8080")
+	want := "http://127.0.0.1:8080/?token=" + srv.Token() + "&session=abcdef1234567890"
+	if got != want {
+		t.Fatalf("URL = %q, want %q", got, want)
+	}
+}
+
+func TestStoredConversationIsRestoredIntoTheTranscript(t *testing.T) {
+	ag := &fakeAgent{}
+	ag.setHistory(
+		agent.NewUserMessage("list the go files"),
+		agent.Message{Role: agent.RoleAssistant, ToolCalls: []agent.ToolCall{
+			{ID: "call-1", Name: "ls", Arguments: `{"path":"."}`},
+		}},
+		agent.Message{Role: agent.RoleTool, ToolCallID: "call-1", ToolName: "ls", Content: "main.go\nreadme.md"},
+		agent.Message{Role: agent.RoleAssistant, Content: "Two files."},
+		agent.Message{Role: agent.RoleUser, Content: "and the bash tool?"},
+		agent.Message{Role: agent.RoleAssistant, ToolCalls: []agent.ToolCall{
+			{ID: "call-2", Name: "bash", Arguments: `{"command":"exit 1"}`},
+		}},
+		agent.Message{Role: agent.RoleTool, ToolCallID: "call-2", ToolName: "bash",
+			Content: "Error: exit status 1"},
+	)
+	srv := newTestServer(t, ag)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	stream := connectSSE(t, ts.URL, srv.Token())
+	defer stream.close()
+	ev := stream.waitFor(t, "state")
+
+	var kinds, titles []string
+	for _, b := range ev.Blocks {
+		kinds = append(kinds, b.Kind)
+		titles = append(titles, b.Title)
+	}
+	want := []string{"user", "tool", "assistant", "user", "tool", "system"}
+	if strings.Join(kinds, ",") != strings.Join(want, ",") {
+		t.Fatalf("blocks = %v (%v), want %v", kinds, titles, want)
+	}
+	if body := ev.Blocks[0].Body; body != "list the go files" {
+		t.Fatalf("user block = %q", body)
+	}
+	if body := ev.Blocks[1].Body; body != "main.go\nreadme.md" {
+		t.Fatalf("tool result not folded into its call: %q", body)
+	}
+	if ev.Blocks[1].IsError {
+		t.Fatal("a successful result must not be marked as an error")
+	}
+	if !ev.Blocks[4].IsError {
+		t.Fatalf("a failed result must be marked as an error: %+v", ev.Blocks[4])
+	}
+	if !ev.Blocks[0].Done || !ev.Blocks[1].Done {
+		t.Fatal("restored blocks must be complete, not streaming")
+	}
+}
+
+func TestOpenSessionCallbackRestoresTheNamedSession(t *testing.T) {
+	ag := &fakeAgent{}
+	id := "aaaa000011112222"
+	var opened string
+	srv := newTestServer(t, ag, func(o *Options) {
+		o.SessionID = func() string { return id }
+		o.OpenSession = func(want string) error {
+			opened = want
+			ag.setHistory(agent.NewUserMessage("from " + want))
+			id = want
+			return nil
+		}
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/?token=" + srv.Token() + "&session=cccc666677778888")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if opened != "cccc666677778888" {
+		t.Fatalf("opened = %q, want the session named in the URL", opened)
+	}
+	if id != "cccc666677778888" {
+		t.Fatalf("server session = %q", id)
+	}
+
+	stream := connectSSE(t, ts.URL, srv.Token())
+	defer stream.close()
+	state := stream.waitFor(t, "state")
+	if state.SessionID != "cccc666677778888" {
+		t.Fatalf("state sessionId = %q", state.SessionID)
+	}
+	if len(state.Blocks) == 0 || state.Blocks[0].Body != "from cccc666677778888" {
+		t.Fatalf("transcript not restored from the opened session: %+v", state.Blocks)
+	}
+}
+
+func TestUnknownSessionInTheURLLeavesTheConsoleUsable(t *testing.T) {
+	var attempts int
+	srv := newTestServer(t, &fakeAgent{}, func(o *Options) {
+		o.SessionID = func() string { return "aaaa000011112222" }
+		o.OpenSession = func(string) error {
+			attempts++
+			return errors.New("no such session")
+		}
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/?token=" + srv.Token() + "&session=missing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("index status = %d, want a served page", resp.StatusCode)
+	}
+	if attempts != 1 {
+		t.Fatalf("open attempts = %d", attempts)
+	}
+	if got := srv.SessionID(); got != "aaaa000011112222" {
+		t.Fatalf("session changed to %q after a failed open", got)
 	}
 }

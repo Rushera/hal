@@ -4,9 +4,11 @@
 // render is forwarded to the page over server-sent events.
 //
 // The page is intentionally plain HTML/CSS/JS with no build step. The server
-// binds to a loopback address by default and every request must carry a random
-// token generated at startup, so other pages open in the same browser cannot
-// drive the agent (the token defeats cross-site request forgery).
+// binds to a loopback address by default and every request must carry an access
+// token, so other pages open in the same browser cannot drive the agent (the
+// token defeats cross-site request forgery). The token is reused from a file
+// when one is configured, so a restarted process keeps serving the page that is
+// already open.
 package web
 
 import (
@@ -21,7 +23,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -70,10 +74,22 @@ type Options struct {
 	Context context.Context
 	// InitialPrompt, when set, starts a run as soon as the server is created.
 	InitialPrompt string
+	// Token is an explicit access token. When it is empty and TokenFile is set,
+	// the token stored there is reused, so a restarted process keeps accepting
+	// the page that is already open; a random token is generated and persisted
+	// when the file does not exist yet.
+	Token     string
+	TokenFile string
 	// SessionInfo describes the current session (/session).
 	SessionInfo func() string
+	// SessionID reports the id of the current session, if any. It is put in the
+	// console URL and in every state snapshot.
+	SessionID func() string
 	// NewSession starts a fresh session file and returns its description.
 	NewSession func() (string, error)
+	// OpenSession switches to a stored session by id. The page URL names the
+	// session it was opened in, so reloading a tab reopens that conversation.
+	OpenSession func(id string) error
 }
 
 // Block is one entry of the transcript shown in the page.
@@ -97,18 +113,20 @@ type outEvent struct {
 	DurationMS int64  `json:"durationMs,omitempty"`
 
 	// status / state
-	Running  bool     `json:"running"`
-	Model    string   `json:"model,omitempty"`
-	Provider string   `json:"provider,omitempty"`
-	Status   string   `json:"status,omitempty"`
-	UsageIn  int      `json:"usageIn"`
-	UsageOut int      `json:"usageOut"`
-	Turns    int      `json:"turns"`
-	Session  string   `json:"session,omitempty"`
-	Cwd      string   `json:"cwd,omitempty"`
-	Version  string   `json:"version,omitempty"`
-	Tools    []string `json:"tools,omitempty"`
-	Blocks   []Block  `json:"blocks,omitempty"`
+	Running  bool   `json:"running"`
+	Model    string `json:"model,omitempty"`
+	Provider string `json:"provider,omitempty"`
+	Status   string `json:"status,omitempty"`
+	UsageIn  int    `json:"usageIn"`
+	UsageOut int    `json:"usageOut"`
+	Turns    int    `json:"turns"`
+	Session  string `json:"session,omitempty"`
+	// SessionID is the current session's id, which the page keeps in its URL.
+	SessionID string   `json:"sessionId,omitempty"`
+	Cwd       string   `json:"cwd,omitempty"`
+	Version   string   `json:"version,omitempty"`
+	Tools     []string `json:"tools,omitempty"`
+	Blocks    []Block  `json:"blocks,omitempty"`
 }
 
 // Server holds the console state shared by every connected page.
@@ -133,8 +151,9 @@ type Server struct {
 	lastErr  error
 }
 
-// New builds the console, generating its access token and starting the initial
-// prompt if one was supplied.
+// New builds the console, resolving its access token, restoring any stored
+// conversation into the transcript, and starting the initial prompt if one was
+// supplied.
 func New(opts Options) *Server {
 	if opts.Context == nil {
 		opts.Context = context.Background()
@@ -142,15 +161,28 @@ func New(opts Options) *Server {
 	if opts.Version == "" {
 		opts.Version = "dev"
 	}
+	token := strings.TrimSpace(opts.Token)
+	if token == "" && opts.TokenFile != "" {
+		t, err := loadOrCreateToken(opts.TokenFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "hal web: cannot use the token file %s: %v\n", opts.TokenFile, err)
+		} else {
+			token = t
+		}
+	}
+	if token == "" {
+		token = newToken()
+	}
 	s := &Server{
 		opts:    opts,
 		baseCtx: opts.Context,
-		token:   newToken(),
+		token:   token,
 		subs:    map[chan []byte]struct{}{},
 		cur:     -1,
 		curTool: -1,
 		status:  "ready",
 	}
+	s.seedFromHistory()
 	if strings.TrimSpace(opts.InitialPrompt) != "" {
 		_, _ = s.Submit(opts.InitialPrompt)
 	}
@@ -160,6 +192,30 @@ func New(opts Options) *Server {
 // Token is the access token required by every request.
 func (s *Server) Token() string { return s.token }
 
+// loadOrCreateToken returns the token persisted at path, writing a fresh one
+// with owner-only permissions when the file is missing or empty.
+func loadOrCreateToken(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	switch {
+	case err == nil:
+		if tok := strings.TrimSpace(string(data)); tok != "" {
+			return tok, nil
+		}
+	case !errors.Is(err, os.ErrNotExist):
+		return "", err
+	}
+	tok := newToken()
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return "", err
+		}
+	}
+	if err := os.WriteFile(path, []byte(tok+"\n"), 0o600); err != nil {
+		return "", err
+	}
+	return tok, nil
+}
+
 func newToken() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
@@ -168,8 +224,17 @@ func newToken() string {
 	return hex.EncodeToString(b)
 }
 
+// SessionID is the id of the session the console is serving, or "" when
+// sessions are disabled.
+func (s *Server) SessionID() string {
+	if s.opts.SessionID == nil {
+		return ""
+	}
+	return strings.TrimSpace(s.opts.SessionID())
+}
+
 // URL renders the address the page should be opened at, rewriting wildcard
-// hosts, and including the access token.
+// hosts, and including the access token and the current session.
 func (s *Server) URL(addr string) string {
 	host, port, err := net.SplitHostPort(addr)
 	if err == nil {
@@ -178,7 +243,11 @@ func (s *Server) URL(addr string) string {
 		}
 		addr = net.JoinHostPort(host, port)
 	}
-	return fmt.Sprintf("http://%s/?token=%s", addr, s.token)
+	u := fmt.Sprintf("http://%s/?token=%s", addr, s.token)
+	if id := s.SessionID(); id != "" {
+		u += "&session=" + url.QueryEscape(id)
+	}
+	return u
 }
 
 // ListenAndServe serves the console until ctx is cancelled.
@@ -246,6 +315,9 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// The URL names the session this tab was opened in; reopen it before the
+	// page subscribes, so its first snapshot already holds the conversation.
+	s.adoptSession(r.URL.Query().Get("session"))
 	page, err := assets.ReadFile("index.html")
 	if err != nil {
 		http.Error(w, "console assets are missing", http.StatusInternalServerError)
@@ -254,6 +326,96 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write(page)
+}
+
+// adoptSession switches the console to the session named in the page URL. It is
+// a no-op when that session is already current, when no opener is configured, or
+// while a turn is running.
+func (s *Server) adoptSession(id string) {
+	id = strings.TrimSpace(id)
+	if id == "" || s.opts.OpenSession == nil || id == s.SessionID() {
+		return
+	}
+	s.mu.Lock()
+	running := s.running
+	s.mu.Unlock()
+	if running {
+		return
+	}
+	if err := s.opts.OpenSession(id); err != nil {
+		fmt.Fprintf(os.Stderr, "hal web: cannot open session %s: %v\n", id, err)
+		return
+	}
+	s.seedFromHistory()
+	s.mu.Lock()
+	s.broadcastLocked(s.statusLocked("state"))
+	s.mu.Unlock()
+}
+
+// seedFromHistory replaces the transcript with one rebuilt from the conversation
+// the agent holds, so a page that loads after a restart shows the whole session
+// instead of an empty console.
+func (s *Server) seedFromHistory() {
+	blocks := historyBlocks(s.opts.Agent)
+	if len(blocks) > 0 {
+		blocks = append(blocks, Block{
+			Kind:  kindSystem,
+			Title: "restored",
+			Body:  fmt.Sprintf("%d messages from the stored session", len(blocks)),
+			Done:  true,
+		})
+	}
+	s.mu.Lock()
+	s.blocks = blocks
+	s.cur, s.curTool = -1, -1
+	s.mu.Unlock()
+}
+
+// historyBlocks renders stored conversation messages as console blocks, reusing
+// the same shapes the live event stream produces: one block per user turn and
+// assistant answer, one per tool call with its result folded in.
+func historyBlocks(a Agent) []Block {
+	if a == nil {
+		return nil
+	}
+	var blocks []Block
+	toolAt := map[string]int{}
+	for _, m := range a.Messages() {
+		switch m.Role {
+		case agent.RoleUser:
+			if strings.TrimSpace(m.Content) == "" {
+				continue
+			}
+			blocks = append(blocks, Block{Kind: kindUser, Body: m.Content, Done: true})
+		case agent.RoleAssistant:
+			if strings.TrimSpace(m.Content) != "" {
+				blocks = append(blocks, Block{Kind: kindAssistant, Body: m.Content, Done: true})
+			}
+			for _, call := range m.ToolCalls {
+				title := call.Name + "(" + summarizeArgs(call.Arguments) + ")"
+				if call.ID != "" {
+					toolAt[call.ID] = len(blocks)
+				}
+				blocks = append(blocks, Block{Kind: kindTool, Title: title})
+			}
+		case agent.RoleTool:
+			at, ok := toolAt[m.ToolCallID]
+			if !ok || at >= len(blocks) {
+				continue
+			}
+			blocks[at].Body = m.Content
+			blocks[at].IsError = toolResultFailed(m.Content)
+			blocks[at].Done = true
+		}
+	}
+	return blocks
+}
+
+// toolResultFailed reports whether a stored tool result looks like a failure.
+// The result's IsError flag is not part of the session file, but a failed tool
+// appends its error as "Error: ...".
+func toolResultFailed(content string) bool {
+	return strings.HasPrefix(content, "Error: ") || strings.Contains(content, "\nError: ")
 }
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
@@ -448,6 +610,7 @@ func (s *Server) statusLocked(evType string) outEvent {
 	if s.opts.SessionInfo != nil {
 		ev.Session = s.opts.SessionInfo()
 	}
+	ev.SessionID = s.SessionID()
 	if evType == "state" {
 		ev.Blocks = append([]Block(nil), s.blocks...)
 	}

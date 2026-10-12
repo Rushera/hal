@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -56,6 +57,7 @@ type options struct {
 	showVersion  bool
 	web          bool
 	webAddr      string
+	webToken     string
 	prompts      []string
 	files        []string
 }
@@ -156,15 +158,24 @@ func runWithArgs(args []string) error {
 			}
 			ag.History = append([]agent.Message(nil), sess.Messages...)
 		case opts.cont:
+			// Continuing with nothing stored yet starts a fresh session instead of
+			// failing, so "hal --web -c" works on the first run of a directory.
 			latest, lerr := session.LatestIn(session.SearchRoots(opts.sessionDir), cwd)
-			if lerr != nil {
+			switch {
+			case errors.Is(lerr, session.ErrNoSessions):
+				sess, err = session.New(root, cwd, opts.name, prov.ModelName())
+				if err != nil {
+					return fmt.Errorf("cannot create session: %w", err)
+				}
+			case lerr != nil:
 				return lerr
+			default:
+				sess, err = session.Load(latest)
+				if err != nil {
+					return fmt.Errorf("cannot load session %s: %w", latest, err)
+				}
+				ag.History = append([]agent.Message(nil), sess.Messages...)
 			}
-			sess, err = session.Load(latest)
-			if err != nil {
-				return fmt.Errorf("cannot load session %s: %w", latest, err)
-			}
-			ag.History = append([]agent.Message(nil), sess.Messages...)
 		default:
 			sess, err = session.New(root, cwd, opts.name, prov.ModelName())
 			if err != nil {
@@ -196,7 +207,7 @@ func runWithArgs(args []string) error {
 
 	switch {
 	case opts.web:
-		return runWeb(ctx, ag, cwd, prompt, opts.sessionDir, sess, opts.webAddr)
+		return runWeb(ctx, ag, cwd, prompt, opts.sessionDir, sess, opts.webAddr, opts.webToken)
 	case jsonMode:
 		return runJSON(ctx, ag, prompt)
 	case interactive:
@@ -242,6 +253,7 @@ func parseArgs(args []string) (options, map[string]bool, error) {
 	fs.BoolVar(&o.showVersion, "version", false, "print version and exit")
 	fs.BoolVar(&o.web, "web", false, "serve the console in a browser instead of the terminal")
 	fs.StringVar(&o.webAddr, "web-addr", "127.0.0.1:8080", "address for --web to listen on")
+	fs.StringVar(&o.webToken, "web-token", "", "access token for --web (default $HAL_WEB_TOKEN, else a token persisted in the state directory)")
 
 	if err := fs.Parse(args); err != nil {
 		return o, nil, err
@@ -386,6 +398,12 @@ func resolveOptions(o options, set map[string]bool, cfg config.Loaded) (options,
 	o.name = pickString("name", o.name, []string{"name", "n"}, nil, cfg.File.Name, "")
 	o.noSession = pickBool("no_session", o.noSession, []string{"no-session"}, cfg.File.NoSession)
 	o.noContext = pickBool("no_context_files", o.noContext, []string{"nc", "no-context-files"}, cfg.File.NoContextFiles)
+	// The web token is deliberately not part of the printed settings: it is a
+	// local secret, and the default (reuse or create the state-dir token) is what
+	// keeps an open browser tab working across restarts.
+	if o.webToken == "" {
+		o.webToken = strings.TrimSpace(os.Getenv("HAL_WEB_TOKEN"))
+	}
 	return o, sources
 }
 
@@ -592,38 +610,82 @@ func sessionSummary(sess *session.Session) string {
 	return fmt.Sprintf("id %s · %s · %d messages", sess.ID, sess.Path, len(sess.Messages))
 }
 
-// sessionHooks returns the SessionInfo/NewSession callbacks shared by the
-// interactive terminal UI and the web console. When the console starts a fresh
-// session, both the agent and the (possibly replaced) session are rewired so
-// persistence keeps working.
-func sessionHooks(ag *agent.Agent, cwd, sessionDir string, sess *session.Session) (func() string, func() (string, error)) {
+// sessionCallbacks are the session controls the TUI and the web console share.
+// Each one reads the session variable they close over, so replacing the session
+// (a new one, or one reopened from a page URL) keeps all of them in step.
+type sessionCallbacks struct {
+	// Info describes the session for the footer.
+	Info func() string
+	// ID reports the session id, or "" when sessions are disabled.
+	ID func() string
+	// New starts a fresh session file.
+	New func() (string, error)
+	// Open switches to the stored session with the given id.
+	Open func(id string) error
+}
+
+// sessionHooks returns the callbacks shared by the interactive terminal UI and
+// the web console. When the console starts or reopens a session, the agent and
+// the (possibly replaced) session are rewired so persistence keeps working.
+func sessionHooks(ag *agent.Agent, cwd, sessionDir string, sess *session.Session) sessionCallbacks {
 	if sess == nil {
-		return nil, nil
+		return sessionCallbacks{Info: func() string { return "" }, ID: func() string { return "" }}
 	}
-	info := func() string { return sessionSummary(sess) }
+	info := func() string {
+		if sess == nil {
+			return ""
+		}
+		return sessionSummary(sess)
+	}
+	id := func() string {
+		if sess == nil {
+			return ""
+		}
+		return sess.ID
+	}
+	adopt := func(ns *session.Session) {
+		sess = ns
+		ag.History = append([]agent.Message(nil), ns.Messages...)
+		if ns.ID != "" {
+			ag.SetSessionID(ns.ID)
+		}
+		ag.OnMessage = func(m agent.Message) { _ = ns.AppendMessage(m) }
+	}
 	newSession := func() (string, error) {
 		ns, err := session.New(session.RootWith(sessionDir), cwd, "", ag.ModelName())
 		if err != nil {
 			return "", err
 		}
-		sess = ns
-		ag.SetSessionID(ns.ID)
-		ag.OnMessage = func(m agent.Message) { _ = ns.AppendMessage(m) }
-		info = func() string { return sessionSummary(ns) }
+		adopt(ns)
 		return "(session " + ns.ID[:8] + ")", nil
 	}
-	return info, newSession
+	openSession := func(want string) error {
+		path, err := session.FindByID(session.RootWith(sessionDir), want)
+		if err != nil {
+			return err
+		}
+		ns, err := session.Load(path)
+		if err != nil {
+			return err
+		}
+		if sess != nil {
+			_ = sess.Close()
+		}
+		adopt(ns)
+		return nil
+	}
+	return sessionCallbacks{Info: info, ID: id, New: newSession, Open: openSession}
 }
 
 func runInteractive(ag *agent.Agent, cwd, prompt, sessionDir string, sess *session.Session) error {
-	infoFn, newFn := sessionHooks(ag, cwd, sessionDir, sess)
+	cbs := sessionHooks(ag, cwd, sessionDir, sess)
 	opts := tui.Options{
 		Agent:         ag,
 		Cwd:           cwd,
 		Version:       version,
 		InitialPrompt: prompt,
-		SessionInfo:   infoFn,
-		NewSession:    newFn,
+		SessionInfo:   cbs.Info,
+		NewSession:    cbs.New,
 	}
 	p := tea.NewProgram(tui.New(opts))
 	_, err := p.Run()
@@ -632,16 +694,22 @@ func runInteractive(ag *agent.Agent, cwd, prompt, sessionDir string, sess *sessi
 
 // runWeb serves the same console in a browser. The agent, tools, session and
 // event stream are shared with the terminal UI; only the rendering differs.
-func runWeb(ctx context.Context, ag *agent.Agent, cwd, prompt, sessionDir string, sess *session.Session, addr string) error {
-	infoFn, newFn := sessionHooks(ag, cwd, sessionDir, sess)
+func runWeb(ctx context.Context, ag *agent.Agent, cwd, prompt, sessionDir string, sess *session.Session, addr, token string) error {
+	cbs := sessionHooks(ag, cwd, sessionDir, sess)
 	srv := web.New(web.Options{
 		Agent:         ag,
 		Cwd:           cwd,
 		Version:       version,
 		Context:       ctx,
 		InitialPrompt: prompt,
-		SessionInfo:   infoFn,
-		NewSession:    newFn,
+		SessionInfo:   cbs.Info,
+		SessionID:     cbs.ID,
+		NewSession:    cbs.New,
+		OpenSession:   cbs.Open,
+		Token:         token,
+		// Persisting the token keeps the page that is already open working
+		// across a restart, which is what makes refreshing enough.
+		TokenFile: filepath.Join(config.Resolve().StateDir, "web-token"),
 	})
 	return srv.ListenAndServe(ctx, addr)
 }
@@ -680,6 +748,7 @@ modes:
 
 options:
   -c, --continue       continue the most recent session for this directory
+                       (start a new one when there is nothing to continue)
   --session <path>     open a specific session file
   --no-session         do not persist the session
   -n, --name <name>    session display name
@@ -697,6 +766,9 @@ options:
   --show-config        print the resolved configuration and exit
   --web                serve the console in a browser instead of the terminal
   --web-addr <addr>    address for --web to listen on (default 127.0.0.1:8080)
+  --web-token <token>  access token for --web (default $HAL_WEB_TOKEN, else a
+                       token persisted in $XDG_STATE_HOME/hal/web-token, so an
+                       open browser tab keeps working across a restart)
   -h, --help           show this help
   -v, --version        show the version
 
@@ -725,6 +797,7 @@ environment:
   HAL_MODEL / OPENAI_MODEL          model (default gpt-4o-mini)
   HAL_CONFIG                        configuration file path
   HAL_SESSION_DIR                   session storage root
+  HAL_WEB_TOKEN                     access token for --web
   XDG_CONFIG_HOME / XDG_DATA_HOME / XDG_STATE_HOME   base directories
 
 examples:

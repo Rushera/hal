@@ -213,3 +213,48 @@ func TestLatestInFindsNewestAcrossRoots(t *testing.T) {
 		t.Fatalf("expected the newer session %s, got %s", newer.Path, found)
 	}
 }
+
+func TestFindByIDAcceptsFullAndShortIDs(t *testing.T) {
+	isolate(t)
+	root := t.TempDir()
+	cwd := t.TempDir()
+
+	s, err := New(root, cwd, "named", "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AppendMessage(agent.NewUserMessage("hello")); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+
+	for _, id := range []string{s.ID, s.ID[:8]} {
+		path, err := FindByID(root, id)
+		if err != nil {
+			t.Fatalf("FindByID(%q): %v", id, err)
+		}
+		if path != s.Path {
+			t.Fatalf("FindByID(%q) = %s, want %s", id, path, s.Path)
+		}
+	}
+
+	// a different project directory is searched too, not just the current cwd
+	other, err := New(root, t.TempDir(), "other", "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = other.Close()
+	if path, err := FindByID(root, other.ID); err != nil || path != other.Path {
+		t.Fatalf("FindByID across project dirs = %q, %v", path, err)
+	}
+
+	if _, err := FindByID(root, "0123456789abcdef"); err == nil {
+		t.Fatal("expected an error for an unknown id")
+	}
+	if _, err := FindByID(root, ""); err == nil {
+		t.Fatal("expected an error for an empty id")
+	}
+	if _, err := FindByID(filepath.Join(root, "absent"), s.ID); err == nil {
+		t.Fatal("expected an error when the root does not exist")
+	}
+}

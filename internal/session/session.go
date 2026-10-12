@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -290,6 +291,41 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// FindByID locates the file of the session with the given id anywhere under
+// root. Both the full id and the 8-character prefix used in file names are
+// accepted, which is what lets the web console reopen the session named in a
+// page URL.
+func FindByID(root, id string) (string, error) {
+	root, id = strings.TrimSpace(root), strings.TrimSpace(id)
+	if root == "" || id == "" {
+		return "", ErrNoSessions
+	}
+	short := id
+	if len(short) > 8 {
+		short = short[:8]
+	}
+	suffix := "-" + short + ".jsonl"
+	var found string
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), suffix) {
+			return nil
+		}
+		s, err := Load(path)
+		if err != nil {
+			return nil
+		}
+		if s.ID == id || strings.HasPrefix(s.ID, id) {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if found == "" {
+		return "", ErrNoSessions
+	}
+	return found, nil
 }
 
 // Latest returns the most recently modified session for a working directory.

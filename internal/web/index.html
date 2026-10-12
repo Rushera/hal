@@ -142,9 +142,13 @@
 (function () {
   "use strict";
 
-  var token = new URLSearchParams(location.search).get("token") || "";
-  // Keep the token out of the address bar and history once it has been read.
-  try { history.replaceState(null, "", location.pathname); } catch (e) {}
+  var params = new URLSearchParams(location.search);
+  var token = params.get("token") || "";
+  // The URL carries the session this tab belongs to, so reloading the page (or
+  // reopening it from history) restores the same conversation. It is kept in
+  // the address bar on purpose: the token is persisted by the server, so the
+  // page keeps working across a restart without being reopened.
+  var urlSession = params.get("session") || "";
 
   var transcript = document.getElementById("transcript");
   var input = document.getElementById("input");
@@ -156,7 +160,7 @@
   var usageEl = document.getElementById("usage");
 
   var state = { running: false, model: "", provider: "", status: "", usageIn: 0, usageOut: 0,
-                turns: 0, session: "", cwd: "", version: "", tools: [] };
+                turns: 0, session: "", sessionId: "", cwd: "", version: "", tools: [] };
   var blocks = [];
   var openAssistant = -1;
   var openTool = -1;
@@ -275,6 +279,7 @@
         openAssistant = -1;
         openTool = -1;
         render();
+        syncSession(ev);
         break;
       case "status":
         applyState(ev);
@@ -324,6 +329,27 @@
     }
   }
 
+  // syncSession keeps the URL pointing at the session this tab is showing, so a
+  // reload reopens the same conversation (a /new session included).
+  function syncSession(ev) {
+    var id = ev.sessionId || "";
+    if (!id) return;
+    if (urlSession && urlSession !== id) {
+      appendBlock({ kind: "system", title: "session",
+        body: "this console is now showing session " + short(id) +
+              " (was " + short(urlSession) + "); reload to return to it", done: true });
+    }
+    if (urlSession === id) return;
+    urlSession = id;
+    try {
+      var p = new URLSearchParams(location.search);
+      p.set("session", id);
+      history.replaceState(null, "", location.pathname + "?" + p.toString());
+    } catch (e) {}
+  }
+
+  function short(id) { return String(id).slice(0, 8); }
+
   function applyState(ev) {
     state.running = !!ev.running;
     state.model = ev.model || "";
@@ -333,6 +359,7 @@
     state.usageOut = ev.usageOut || 0;
     state.turns = ev.turns || 0;
     state.session = ev.session || "";
+    state.sessionId = ev.sessionId || "";
     state.cwd = ev.cwd || "";
     state.version = ev.version || "";
     state.tools = ev.tools || [];

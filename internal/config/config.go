@@ -5,7 +5,7 @@
 //
 //	$XDG_CONFIG_HOME/hal/config.toml   (or config.json)   user configuration
 //	$XDG_DATA_HOME/hal/sessions/                          session files
-//	$XDG_STATE_HOME/hal/                                  state (reserved)
+//	$XDG_STATE_HOME/hal/web-token                         web console token
 //
 // XDG_CONFIG_HOME defaults to ~/.config, XDG_DATA_HOME to ~/.local/share and
 // XDG_STATE_HOME to ~/.local/state. Relative values in those variables are

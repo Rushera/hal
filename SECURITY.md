@@ -14,8 +14,12 @@ and reduce the surface when you can:
 
 - `--tools read,grep,find,ls` for read-only work, or `--print` for one-shot runs.
 - Leave `--web-addr` on its default `127.0.0.1`; the console authenticates every
-  request with a random per-run token, which is what stops a page on another
-  origin from reaching the API through your browser's loopback access.
+  request with the access token in its URL, which is what stops a page on another
+  origin from reaching the API through your browser's loopback access. The token
+  is reused from `$XDG_STATE_HOME/hal/web-token` (mode `0600`) so a restarted
+  process keeps serving pages that are already open; treat that file as a
+  credential, and prefer it over `--web-token`/`$HAL_WEB_TOKEN`, which pin a
+  value you have to keep secret yourself.
 - Keep credentials in `api_key_env`/the environment rather than in a config file,
   and keep that file mode 600 (hal warns when it is group- or world-readable).
 
