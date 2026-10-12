@@ -1,0 +1,37 @@
+# hal configuration preset for a third-party gateway: a service that speaks the
+# OpenAI chat-completions protocol but wants its own credential variable and a
+# per-conversation session header.
+#
+# Use it explicitly, or copy it to $XDG_CONFIG_HOME/hal/config.toml:
+#
+#     hal --config examples/config.gateway.toml -p "hello"
+#
+# The protocol is what `provider` selects, so it stays "openai"; `base_url`
+# picks the actual service.
+
+provider = "openai"
+
+model = "example-model"
+
+base_url = "https://gateway.example.com/v1"
+
+# Name the environment variable holding the credential rather than pasting the
+# secret into this file. hal checks it before HAL_API_KEY / OPENAI_API_KEY.
+api_key = ""
+api_key_env = "GATEWAY_API_KEY"
+
+# Gateways that route agent traffic by conversation want a stable id in a
+# header. Name it explicitly, or leave "" to use the automatic choice for
+# recognised endpoints.
+session_header = "x-session-id"
+
+tools     = "read,bash,edit,write,grep,find,ls"
+max_turns = 90
+
+append_system_prompt = ""
+
+session_dir = ""
+name        = ""
+
+no_session       = false
+no_context_files = false

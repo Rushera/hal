@@ -30,7 +30,7 @@ base_url = "https://api.openai.com/v1"
 # when it is readable by other users.
 api_key = ""
 # Or name the environment variable holding the key, so the secret stays in one
-# place: api_key_env = "OPENCODE_GO_API_KEY"
+# place: api_key_env = "GATEWAY_API_KEY"
 api_key_env = ""
 
 # --- tools and loop ---------------------------------------------------------

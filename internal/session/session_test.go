@@ -147,36 +147,24 @@ func TestRootWithDefaultsToXDGDataDirectory(t *testing.T) {
 	if got := RootWith(""); got != want {
 		t.Fatalf("RootWith(\"\") = %s, want %s", got, want)
 	}
-	if got := RootWith("/tmp/explicit"); got != "/tmp/explicit" {
-		t.Fatalf("an explicit directory must win: %s", got)
+	if explicit := filepath.Join(t.TempDir(), "explicit"); RootWith(explicit) != explicit {
+		t.Fatalf("an explicit directory must win: %s", RootWith(explicit))
 	}
-	t.Setenv("HAL_SESSION_DIR", "/tmp/from-env")
-	if got := RootWith(""); got != "/tmp/from-env" {
+	fromEnv := filepath.Join(t.TempDir(), "from-env")
+	t.Setenv("HAL_SESSION_DIR", fromEnv)
+	if got := RootWith(""); got != fromEnv {
 		t.Fatalf("HAL_SESSION_DIR must win over XDG: %s", got)
 	}
 }
 
-func TestSearchRootsIncludesLegacyOnlyWhenItExists(t *testing.T) {
+func TestSearchRootsIsTheResolvedRoot(t *testing.T) {
 	home := isolate(t)
-	legacy := filepath.Join(home, ".hal", "sessions")
-
 	roots := SearchRoots("")
 	if len(roots) != 1 {
-		t.Fatalf("expected only the canonical root, got %v", roots)
+		t.Fatalf("expected exactly one root, got %v", roots)
 	}
 	if want := filepath.Join(home, "data", "hal", "sessions"); roots[0] != want {
-		t.Fatalf("canonical root = %s, want %s", roots[0], want)
-	}
-
-	if err := os.MkdirAll(legacy, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	roots = SearchRoots("")
-	if len(roots) != 2 || roots[1] != legacy {
-		t.Fatalf("legacy root should be searched when present, got %v", roots)
-	}
-	if roots[0] == roots[1] {
-		t.Fatalf("canonical root must come first: %v", roots)
+		t.Fatalf("root = %s, want %s", roots[0], want)
 	}
 }
 
@@ -184,32 +172,31 @@ func TestLatestInFindsNewestAcrossRoots(t *testing.T) {
 	home := isolate(t)
 	cwd := t.TempDir()
 	primary := filepath.Join(home, "data", "hal", "sessions")
-	legacy := filepath.Join(home, ".hal", "sessions")
+	secondary := filepath.Join(home, "other-root")
 
-	if _, err := LatestIn([]string{primary, legacy}, cwd); err == nil {
+	if _, err := LatestIn([]string{primary, secondary}, cwd); err == nil {
 		t.Fatal("expected ErrNoSessions when nothing is stored")
 	}
 
-	// an older session in the legacy root
-	old, err := New(legacy, cwd, "legacy", "m")
+	// an older session in the secondary root
+	old, err := New(secondary, cwd, "older", "m")
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = old.AppendMessage(agent.NewUserMessage("old"))
 	_ = old.Close()
 
-	// make the legacy session's timestamp clearly older
 	oldPath := old.Path
 
-	found, err := LatestIn([]string{primary, legacy}, cwd)
+	found, err := LatestIn([]string{primary, secondary}, cwd)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if found != oldPath {
-		t.Fatalf("expected the legacy session, got %s", found)
+		t.Fatalf("expected the session in the secondary root, got %s", found)
 	}
 
-	// a newer session in the canonical root wins
+	// a newer session in the primary root wins
 	time.Sleep(10 * time.Millisecond)
 	newer, err := New(primary, cwd, "newer", "m")
 	if err != nil {
@@ -218,7 +205,7 @@ func TestLatestInFindsNewestAcrossRoots(t *testing.T) {
 	_ = newer.AppendMessage(agent.NewUserMessage("new"))
 	_ = newer.Close()
 
-	found, err = LatestIn([]string{primary, legacy}, cwd)
+	found, err = LatestIn([]string{primary, secondary}, cwd)
 	if err != nil {
 		t.Fatal(err)
 	}

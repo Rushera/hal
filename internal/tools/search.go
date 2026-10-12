@@ -22,7 +22,7 @@ var skipDirs = map[string]bool{
 	"__pycache__": true, ".venv": true, "venv": true, "site-packages": true,
 	".mypy_cache": true, ".pytest_cache": true, ".ruff_cache": true,
 	".gradle": true, ".terraform": true, ".cache": true, ".next": true,
-	".tox": true, ".venv-hermes": true,
+	".tox": true,
 }
 
 const (

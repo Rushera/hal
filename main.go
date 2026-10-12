@@ -507,7 +507,6 @@ func contextFiles(cwd string) ([]contextFile, error) {
 	seen := map[string]bool{}
 	for _, g := range []struct{ dir, label string }{
 		{paths.ConfigDir, "$XDG_CONFIG_HOME/hal"},
-		{paths.LegacyDir, "~/.hal"},
 	} {
 		if g.dir == "" || seen[g.dir] {
 			continue
@@ -703,13 +702,13 @@ options:
 
 configuration file:
   TOML at $XDG_CONFIG_HOME/hal/config.toml (JSON also accepted as config.json).
-  XDG_CONFIG_HOME defaults to ~/.config; a legacy ~/.hal/config.toml is read
-  when the XDG file does not exist. Keys use snake_case and match the flag names:
+  XDG_CONFIG_HOME defaults to ~/.config. Keys use snake_case and match the
+  flag names:
 
     model    = "gpt-4o-mini"
     base_url = "https://api.openai.com/v1"
     api_key  = ""                 # prefer the HAL_API_KEY environment variable
-    api_key_env = ""              # or name a variable, e.g. OPENCODE_GO_API_KEY
+    api_key_env = ""              # or name a variable, e.g. GATEWAY_API_KEY
     tools    = "read,edit"        # comma-separated allowlist
     max_turns = 32
     system_prompt = ""            # text, or a path to a file

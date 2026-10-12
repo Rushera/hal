@@ -32,19 +32,9 @@ func RootWith(dir string) string {
 	return config.Resolve().SessionDir
 }
 
-// SearchRoots returns the directories to search when resuming: the canonical
-// root first, then the pre-XDG ~/.hal/sessions location when it still holds
-// sessions, so earlier work stays reachable.
+// SearchRoots returns the directories to search when resuming a session.
 func SearchRoots(explicit string) []string {
-	primary := RootWith(explicit)
-	roots := []string{primary}
-	legacy := config.Resolve().LegacySessionDir
-	if legacy != primary {
-		if st, err := os.Stat(legacy); err == nil && st.IsDir() {
-			roots = append(roots, legacy)
-		}
-	}
-	return roots
+	return []string{RootWith(explicit)}
 }
 
 // LatestIn returns the most recent session across the given roots.

@@ -64,20 +64,23 @@ func TestExampleJSONMatchesTOML(t *testing.T) {
 	}
 }
 
-// TestExampleOpencodeGoPreset checks the Hermes-matching preset resolves to the
-// gateway endpoint, model and credential variable documented in it.
-func TestExampleOpencodeGoPreset(t *testing.T) {
+// TestExampleGatewayPreset checks the third-party gateway preset resolves to the
+// endpoint, model and credential variable documented in it.
+func TestExampleGatewayPreset(t *testing.T) {
 	isolateXDG(t)
-	cfg := loadExample(t, "config.opencode-go.toml")
+	cfg := loadExample(t, "config.gateway.toml")
 
-	if cfg.File.BaseURL != "https://opencode.ai/zen/go/v1" {
+	if cfg.File.BaseURL != "https://gateway.example.com/v1" {
 		t.Fatalf("base_url = %q", cfg.File.BaseURL)
 	}
-	if cfg.File.Model != "deepseek-v4.1-flash" {
+	if cfg.File.Model != "example-model" {
 		t.Fatalf("model = %q", cfg.File.Model)
 	}
-	if cfg.File.APIKeyEnv != "OPENCODE_GO_API_KEY" {
+	if cfg.File.APIKeyEnv != "GATEWAY_API_KEY" {
 		t.Fatalf("api_key_env = %q", cfg.File.APIKeyEnv)
+	}
+	if cfg.File.SessionHeader != "x-session-id" {
+		t.Fatalf("session_header = %q", cfg.File.SessionHeader)
 	}
 	if cfg.File.APIKey != "" {
 		t.Fatal("the preset must not embed a literal key")
@@ -87,7 +90,7 @@ func TestExampleOpencodeGoPreset(t *testing.T) {
 	}
 
 	// the named variable supplies the credential
-	t.Setenv("OPENCODE_GO_API_KEY", "from-named-env")
+	t.Setenv("GATEWAY_API_KEY", "from-named-env")
 	opts, set, err := parseArgs(nil)
 	if err != nil {
 		t.Fatal(err)
@@ -96,12 +99,12 @@ func TestExampleOpencodeGoPreset(t *testing.T) {
 	if resolved.apiKey != "from-named-env" {
 		t.Fatalf("api key not read from api_key_env: %q", resolved.apiKey)
 	}
-	if resolved.model != "deepseek-v4.1-flash" || resolved.baseURL != "https://opencode.ai/zen/go/v1" {
+	if resolved.model != "example-model" || resolved.baseURL != "https://gateway.example.com/v1" {
 		t.Fatalf("preset not applied: model=%q base_url=%q", resolved.model, resolved.baseURL)
 	}
 	for _, s := range sources {
-		if s.Key == "api_key" && s.Source != "env $OPENCODE_GO_API_KEY" {
-			t.Fatalf("api_key source = %q, want env $OPENCODE_GO_API_KEY", s.Source)
+		if s.Key == "api_key" && s.Source != "env $GATEWAY_API_KEY" {
+			t.Fatalf("api_key source = %q, want env $GATEWAY_API_KEY", s.Source)
 		}
 	}
 }
@@ -111,7 +114,7 @@ func TestExampleOpencodeGoPreset(t *testing.T) {
 func TestAPIKeyEnvPrecedence(t *testing.T) {
 	isolateXDG(t)
 	cfg := config.Loaded{
-		Path: "/tmp/config.toml",
+		Path: filepath.Join(t.TempDir(), "config.toml"),
 		File: config.File{APIKeyEnv: "NAMED_KEY", APIKey: "literal-in-file"},
 	}
 
@@ -133,8 +136,8 @@ func TestAPIKeyEnvPrecedence(t *testing.T) {
 	}
 
 	// so do the generic ones when no name is configured
-	cfg2 := config.Loaded{Path: "/tmp/config.toml"}
-	t.Setenv("OPENCODE_GO_API_KEY", "opencode")
+	cfg2 := config.Loaded{Path: filepath.Join(t.TempDir(), "config.toml")}
+	t.Setenv("GATEWAY_API_KEY", "gateway")
 	t.Setenv("HAL_API_KEY", "generic")
 	resolved, _ = resolveOptions(opts, set, cfg2)
 	if resolved.apiKey != "generic" {

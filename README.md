@@ -1,5 +1,7 @@
 # hal
 
+[![CI](https://github.com/Rushera/hal/actions/workflows/ci.yml/badge.svg)](https://github.com/Rushera/hal/actions/workflows/ci.yml)
+
 A minimal coding agent written in Go, with a
 [bubbletea](https://github.com/charmbracelet/bubbletea) terminal UI.
 
@@ -28,10 +30,12 @@ skill, package, and provider-matrix machinery.
 ## Install
 
 ```bash
-go build -o hal .
+go install github.com/Rushera/hal@latest   # or:
+git clone https://github.com/Rushera/hal && cd hal && go build -o hal .
 ```
 
-`go build` produces a single static binary with no runtime dependencies.
+Building needs Go 1.27.1 or newer (see `go.mod`); `go build` produces a single
+static binary with no runtime dependencies.
 
 ## Configure
 
@@ -53,8 +57,8 @@ paths:
 settings:
   provider             openai
                          ← default
-  model                mock-config-model
-                         ← config ~/.config/hal/config.toml
+  model                gpt-4o-mini
+                         ← default
   api_key              sk-c…og (masked)
                          ← env $HAL_API_KEY
 ```
@@ -94,7 +98,7 @@ stays in one place:
 
 ```toml
 api_key     = ""
-api_key_env = "OPENCODE_GO_API_KEY"
+api_key_env = "GATEWAY_API_KEY"
 ```
 
 The named variable is checked before `HAL_API_KEY` / `OPENAI_API_KEY`; a
@@ -111,18 +115,18 @@ known to want one — currently `x-opencode-session` for `opencode.ai`. Set
 choice. The id is the conversation's session id, so resuming with `-c` keeps the
 same routing affinity; runs with no stored session get a fresh one.
 
-### Example: an opencode-go gateway
+### Example: a third-party gateway
 
-`examples/config.opencode-go.toml` matches a Hermes install configured with
-`provider: opencode-go`, `model: deepseek-v4.1-flash` and
-`base_url: https://opencode.ai/zen/go/v1`:
+`examples/config.gateway.toml` shows the shape of a service that speaks the
+OpenAI protocol but wants its own credential variable and session header:
 
 ```toml
-provider    = "openai"                       # the protocol; the URL picks the service
-model       = "deepseek-v4.1-flash"
-base_url    = "https://opencode.ai/zen/go/v1"
-api_key     = ""
-api_key_env = "OPENCODE_GO_API_KEY"
+provider       = "openai"                    # the protocol; the URL picks the service
+model          = "example-model"
+base_url       = "https://gateway.example.com/v1"
+api_key        = ""
+api_key_env    = "GATEWAY_API_KEY"
+session_header = "x-session-id"              # "" = automatic
 ```
 
 ### Environment variables
@@ -146,10 +150,6 @@ $XDG_CONFIG_HOME/hal/config.toml        (or config.json)   configuration
 $XDG_DATA_HOME/hal/sessions/                              session files
 $XDG_STATE_HOME/hal/                                      reserved
 ```
-
-A pre-XDG `~/.hal/config.toml` is still read when the XDG file is absent, and
-`~/.hal/sessions/` is still searched when resuming, so earlier work remains
-reachable. New sessions are always written under the XDG data directory.
 
 ## Usage
 
@@ -234,18 +234,37 @@ runs with a timeout (default 120s, max 600s) and kills the whole process group
 on timeout, and `grep`/`find` skip `.git`, `node_modules`, `vendor`, and
 similar directories.
 
+## Security
+
+`bash` executes commands with your user's privileges and the model decides what
+to run, so run hal in a directory you are willing to have modified. Model output
+is untrusted input: prompt injection from files hal reads can request arbitrary
+commands. Use `--tools` to drop `bash`/`write`/`edit` for read-only work, and
+`--web-addr` to keep the console on loopback.
+
+The web console binds to `127.0.0.1` by default and authenticates every request
+with the random per-run token in its URL; widening `--web-addr` exposes an
+interface that can run shell commands, so put it behind your own access control.
+Report vulnerabilities privately rather than in a public issue — see
+[SECURITY.md](SECURITY.md).
+
 ## Development
 
 ```bash
 go test ./...          # full suite
-go test -race ./...    # under the race detector
+go test -race ./...    # race detector (Linux/macOS)
 go vet ./...
+gofmt -l .             # must print nothing
 ```
 
 The suite runs the real agent loop against a scripted SSE server over loopback
 and executes the real tools against temp directories, so the tool-call round
 trip, error handling, session persistence, and the TUI's event handling are
 covered end to end.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the ground rules, and
+[CHANGELOG.md](CHANGELOG.md) for what changed in each release. Security issues
+should go through a private advisory, as described in [SECURITY.md](SECURITY.md).
 
 ## Limitations
 

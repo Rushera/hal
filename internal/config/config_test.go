@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,9 +35,6 @@ func TestResolveDefaultsToDotPaths(t *testing.T) {
 	}
 	if want := filepath.Join(home, ".local", "state", "hal"); p.StateDir != want {
 		t.Fatalf("StateDir = %s, want %s", p.StateDir, want)
-	}
-	if want := filepath.Join(home, ".hal"); p.LegacyDir != want {
-		t.Fatalf("LegacyDir = %s, want %s", p.LegacyDir, want)
 	}
 }
 
@@ -90,15 +88,16 @@ func TestLoadTOML(t *testing.T) {
 	if err := os.MkdirAll(p.ConfigDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	content := `
+	sessionDir := filepath.Join(t.TempDir(), "sessions")
+	content := fmt.Sprintf(`
 # hal configuration
 model = "gpt-4o"
 base_url = "https://example.test/v1"
 tools = "read,grep"
 max_turns = 7
 no_context_files = true
-session_dir = "/tmp/sessions"
-`
+session_dir = %q
+`, sessionDir)
 	if err := os.WriteFile(filepath.Join(p.ConfigDir, "config.toml"), []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +119,7 @@ session_dir = "/tmp/sessions"
 	if f.NoContextFiles == nil || !*f.NoContextFiles {
 		t.Fatal("no_context_files = true not parsed")
 	}
-	if f.SessionDir != "/tmp/sessions" {
+	if f.SessionDir != sessionDir {
 		t.Fatalf("session_dir = %q", f.SessionDir)
 	}
 	if len(cfg.Warnings) != 0 {
@@ -168,25 +167,6 @@ func TestTOMLBeatsJSON(t *testing.T) {
 	}
 	if cfg.File.Model != "from-toml" {
 		t.Fatalf("expected config.toml to win, got %q", cfg.File.Model)
-	}
-}
-
-func TestLegacyConfigIsUsedWhenXDGAbsent(t *testing.T) {
-	home := t.TempDir()
-	withEnv(t, home, nil)
-	p := Resolve()
-	if err := os.MkdirAll(p.LegacyDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(p.LegacyDir, "config.toml"), []byte(`model = "legacy-model"`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := Load("", p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.File.Model != "legacy-model" {
-		t.Fatalf("legacy config not read: %+v", cfg.File)
 	}
 }
 
@@ -310,16 +290,12 @@ func TestSessionDirsFollowXDG(t *testing.T) {
 	if want := filepath.Join(home, ".local", "share", "hal", "sessions"); p.SessionDir != want {
 		t.Fatalf("SessionDir = %s, want %s", p.SessionDir, want)
 	}
-	// the legacy location is still exposed so sessions can be resumed from it
-	if want := filepath.Join(home, ".hal", "sessions"); p.LegacySessionDir != want {
-		t.Fatalf("LegacySessionDir = %s, want %s", p.LegacySessionDir, want)
-	}
-	// creating legacy data must not move the canonical location
-	if err := os.MkdirAll(p.LegacySessionDir, 0o755); err != nil {
+	// creating a ~/.hal directory must not move the canonical location
+	if err := os.MkdirAll(filepath.Join(home, ".hal", "sessions"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if got := Resolve().SessionDir; got != p.SessionDir {
-		t.Fatalf("SessionDir moved to legacy data: %s", got)
+		t.Fatalf("SessionDir moved: %s", got)
 	}
 }
 

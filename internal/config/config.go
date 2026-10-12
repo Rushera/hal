@@ -29,10 +29,6 @@ type Paths struct {
 	StateDir  string // $XDG_STATE_HOME/hal
 	// SessionDir is the XDG location for session files.
 	SessionDir string
-	// LegacyDir is the pre-XDG ~/.hal directory, still honored for
-	// configuration and sessions when it already exists.
-	LegacyDir        string
-	LegacySessionDir string
 }
 
 // Resolve computes the directories from the environment.
@@ -44,14 +40,11 @@ func Resolve() Paths {
 	cfgHome := xdgPath("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	dataHome := xdgPath("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
 	stateHome := xdgPath("XDG_STATE_HOME", filepath.Join(home, ".local", "state"))
-	legacy := filepath.Join(home, ".hal")
 	return Paths{
-		ConfigDir:        filepath.Join(cfgHome, "hal"),
-		DataDir:          filepath.Join(dataHome, "hal"),
-		StateDir:         filepath.Join(stateHome, "hal"),
-		SessionDir:       filepath.Join(dataHome, "hal", "sessions"),
-		LegacyDir:        legacy,
-		LegacySessionDir: filepath.Join(legacy, "sessions"),
+		ConfigDir:  filepath.Join(cfgHome, "hal"),
+		DataDir:    filepath.Join(dataHome, "hal"),
+		StateDir:   filepath.Join(stateHome, "hal"),
+		SessionDir: filepath.Join(dataHome, "hal", "sessions"),
 	}
 }
 
@@ -77,8 +70,6 @@ func (p Paths) CandidatePaths() []string {
 	return []string{
 		filepath.Join(p.ConfigDir, "config.toml"),
 		filepath.Join(p.ConfigDir, "config.json"),
-		filepath.Join(p.LegacyDir, "config.toml"),
-		filepath.Join(p.LegacyDir, "config.json"),
 	}
 }
 
@@ -93,7 +84,7 @@ type File struct {
 	// credentials stay out of dotfiles.
 	APIKey string `toml:"api_key" json:"api_key"`
 	// APIKeyEnv names an environment variable to read the key from instead of
-	// storing it here, e.g. "OPENCODE_GO_API_KEY". Checked before the generic
+	// storing it here, e.g. "GATEWAY_API_KEY". Checked before the generic
 	// HAL_API_KEY / OPENAI_API_KEY variables.
 	APIKeyEnv string `toml:"api_key_env" json:"api_key_env"`
 	// Tools is a comma-separated allowlist of built-in tools.
