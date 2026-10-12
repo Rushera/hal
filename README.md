@@ -210,9 +210,10 @@ from a full snapshot, so a dropped connection never duplicates or loses blocks.
 
 ### Context files
 
-`AGENTS.md`, `AGENTS.override.md`, or `CLAUDE.md` are loaded from
-`~/.hal/`, from each parent directory, and from the working directory
-(innermost wins), plus any `AGENTS.md` in the config directory. Disable with
+`AGENTS.md` or `CLAUDE.md` in the config directory (`$XDG_CONFIG_HOME/hal`) is
+loaded first. Then, for each directory from the filesystem root down to the
+working directory, the first of `AGENTS.override.md`, `AGENTS.md`, or
+`CLAUDE.md` that exists is added, so the working directory wins. Disable with
 `--no-context-files`. `--system-prompt` replaces the default prompt;
 `--append-system-prompt` adds to it.
 
