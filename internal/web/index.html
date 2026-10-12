@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hal</title>
+<style>
+  :root {
+    --bg: #14151a;
+    --panel: #1b1d24;
+    --panel-2: #21242c;
+    --border: #2c303a;
+    --text: #d8dae0;
+    --muted: #8b909c;
+    --accent: #d787ff;
+    --user: #4fb3ff;
+    --tool: #e0a458;
+    --error: #ff6b6b;
+    --ok: #6fd08c;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    display: flex;
+    align-items: baseline;
+    gap: .6rem;
+    padding: .7rem 1rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  header .name { color: var(--accent); font-weight: 700; }
+  header .cwd { color: var(--muted); font-size: .85rem; overflow: hidden;
+                text-overflow: ellipsis; white-space: nowrap; }
+  #transcript {
+    flex: 1;
+    overflow-y: auto;
+    padding: 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: .85rem;
+  }
+  .empty { color: var(--muted); }
+  .block { max-width: 60rem; width: 100%; margin: 0 auto; }
+  .block .head { font-weight: 600; margin-bottom: .2rem; }
+  .block pre {
+    margin: 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .user .head { color: var(--user); }
+  .user pre { white-space: pre-wrap; }
+  .assistant .head { color: var(--accent); }
+  .assistant pre { font: inherit; }
+  .tool .head { color: var(--tool); }
+  .tool pre { color: #b9bec9; background: var(--panel-2);
+              border: 1px solid var(--border); border-radius: 6px; padding: .55rem .7rem; }
+  .tool.error pre { color: var(--error); border-color: #4a2b2b; }
+  .system { color: var(--muted); font-size: .9rem; }
+  .error .head { color: var(--error); }
+  .error pre { color: var(--error); }
+  .thinking { color: var(--muted); font-style: italic; }
+  footer {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: .45rem 1rem;
+    border-top: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--muted);
+    font-size: .82rem;
+  }
+  footer .right { white-space: nowrap; }
+  .status-working { color: var(--accent); }
+  .composer {
+    border-top: 1px solid var(--border);
+    background: var(--panel);
+    padding: .7rem 1rem 1rem;
+  }
+  .row { display: flex; gap: .6rem; max-width: 60rem; margin: 0 auto; align-items: flex-end; }
+  textarea {
+    flex: 1;
+    resize: vertical;
+    min-height: 3.2rem;
+    max-height: 14rem;
+    padding: .6rem .7rem;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font: 14px/1.5 ui-sans-serif, system-ui, sans-serif;
+  }
+  textarea:focus { outline: none; border-color: var(--accent); }
+  button {
+    padding: .55rem 1rem;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--panel-2);
+    color: var(--text);
+    font: inherit;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--muted); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #1a1020; font-weight: 600; }
+  button.primary:hover { filter: brightness(1.08); }
+  button:disabled { opacity: .5; cursor: default; }
+  .hint { max-width: 60rem; margin: .45rem auto 0; color: var(--muted); font-size: .78rem; }
+  .hint code { color: var(--text); }
+</style>
+</head>
+<body>
+<header>
+  <span class="name" id="title">hal</span>
+  <span class="cwd" id="cwd"></span>
+</header>
+
+<div id="transcript"><p class="empty">(empty conversation — type a task)</p></div>
+
+<div class="composer">
+  <div class="row">
+    <textarea id="input" rows="2" placeholder="Ask hal to do something…  (Enter to send, Shift+Enter for a newline; /help for commands)"></textarea>
+    <button class="primary" id="send">Send</button>
+    <button id="abort">Abort</button>
+  </div>
+  <div class="hint"><code>esc</code> aborts &middot; <code>/help /model /new /session /tools /clear</code></div>
+</div>
+
+<footer>
+  <span id="session"></span>
+  <span class="right" id="usage"></span>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  var token = new URLSearchParams(location.search).get("token") || "";
+  // Keep the token out of the address bar and history once it has been read.
+  try { history.replaceState(null, "", location.pathname); } catch (e) {}
+
+  var transcript = document.getElementById("transcript");
+  var input = document.getElementById("input");
+  var sendBtn = document.getElementById("send");
+  var abortBtn = document.getElementById("abort");
+  var titleEl = document.getElementById("title");
+  var cwdEl = document.getElementById("cwd");
+  var sessionEl = document.getElementById("session");
+  var usageEl = document.getElementById("usage");
+
+  var state = { running: false, model: "", provider: "", status: "", usageIn: 0, usageOut: 0,
+                turns: 0, session: "", cwd: "", version: "", tools: [] };
+  var blocks = [];
+  var openAssistant = -1;
+  var openTool = -1;
+
+  function api(path, body) {
+    return fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Hal-Token": token },
+      body: JSON.stringify(body || {})
+    }).then(function (resp) {
+      return resp.json().catch(function () { return {}; }).then(function (data) {
+        if (!resp.ok) throw new Error(data.error || ("HTTP " + resp.status));
+        return data;
+      });
+    });
+  }
+
+  // ---- rendering ----------------------------------------------------------
+
+  function render() {
+    transcript.textContent = "";
+    if (blocks.length === 0) {
+      var p = document.createElement("p");
+      p.className = "empty";
+      p.textContent = "(empty conversation — type a task)";
+      transcript.appendChild(p);
+    } else {
+      blocks.forEach(function (b) {
+        transcript.appendChild(renderBlock(b));
+      });
+    }
+    scrollToBottom();
+  }
+
+  function renderBlock(b) {
+    var wrap = document.createElement("div");
+    wrap.className = "block " + b.kind + (b.isError ? " error" : "");
+
+    if (b.title) {
+      var head = document.createElement("div");
+      head.className = "head";
+      head.textContent = prefix(b.kind) + b.title;
+      wrap.appendChild(head);
+    } else if (b.kind === "user") {
+      var h = document.createElement("div");
+      h.className = "head";
+      h.textContent = "›";
+      wrap.appendChild(h);
+    }
+
+    var body = document.createElement("pre");
+    if (b.kind === "assistant" && !b.body && !b.done) {
+      body.className = "thinking";
+      body.textContent = "thinking…";
+    } else {
+      body.textContent = b.body || "";
+    }
+    wrap.appendChild(body);
+    return wrap;
+  }
+
+  function prefix(kind) {
+    switch (kind) {
+      case "tool": return "⚙ ";
+      case "error": return "✗ ";
+      default: return "";
+    }
+  }
+
+  function nearestScroll() {
+    return transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight < 80;
+  }
+
+  function scrollToBottom() {
+    transcript.scrollTop = transcript.scrollHeight;
+  }
+
+  var stick = true;
+  transcript.addEventListener("scroll", function () { stick = nearestScroll(); });
+
+  function appendBlock(b) {
+    stick = nearestScroll();
+    blocks.push(b);
+    render();
+  }
+
+  function updateFooter() {
+    titleEl.textContent = "hal " + (state.version || "");
+    cwdEl.textContent = state.cwd || "";
+    sessionEl.textContent = state.session || "no session (ephemeral mode)";
+    var model = state.model || "no model";
+    var status = state.running ? "working" : (state.status || "ready");
+    usageEl.textContent = model + " · " + status +
+      " · ↑" + human(state.usageIn) + " ↓" + human(state.usageOut) +
+      " · " + state.turns + " turns";
+    usageEl.className = "right" + (state.running ? " status-working" : "");
+    sendBtn.disabled = false;
+    abortBtn.disabled = !state.running;
+  }
+
+  function human(n) {
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + "k";
+    return String(n);
+  }
+
+  // ---- event handling -----------------------------------------------------
+  // The server sends a full "state" snapshot on connect, then deltas. A
+  // reconnecting EventSource therefore resynchronises instead of duplicating.
+
+  function handle(ev) {
+    switch (ev.type) {
+      case "state":
+        applyState(ev);
+        blocks = ev.blocks || [];
+        openAssistant = -1;
+        openTool = -1;
+        render();
+        break;
+      case "status":
+        applyState(ev);
+        updateFooter();
+        break;
+      case "clear":
+        blocks = [];
+        openAssistant = -1;
+        openTool = -1;
+        render();
+        break;
+      case "user":
+        appendBlock({ kind: "user", body: ev.text || "", done: true });
+        break;
+      case "system":
+        appendBlock({ kind: "system", title: ev.title || "", body: ev.text || "", done: true });
+        break;
+      case "error":
+        appendBlock({ kind: "error", title: ev.title || "error", body: ev.text || "", isError: true, done: true });
+        break;
+      case "tool":
+        openAssistant = -1;
+        blocks.push({ kind: "tool", title: ev.title || "", body: "", done: false });
+        openTool = blocks.length - 1;
+        render();
+        break;
+      case "tool_result":
+        var b = openTool >= 0 ? blocks[openTool] : null;
+        if (b) {
+          b.body = ev.body || "";
+          b.isError = !!ev.isError;
+          b.done = true;
+          if (ev.durationMs > 0) b.title = (b.title || "") + "  [" + ev.durationMs + "ms]";
+        }
+        openTool = -1;
+        openAssistant = -1;
+        render();
+        break;
+      case "delta":
+        if (openAssistant < 0 || !blocks[openAssistant] || blocks[openAssistant].kind !== "assistant") {
+          blocks.push({ kind: "assistant", body: "", done: false });
+          openAssistant = blocks.length - 1;
+        }
+        blocks[openAssistant].body += ev.text || "";
+        renderOpen();
+        break;
+    }
+  }
+
+  function applyState(ev) {
+    state.running = !!ev.running;
+    state.model = ev.model || "";
+    state.provider = ev.provider || "";
+    state.status = ev.status || "";
+    state.usageIn = ev.usageIn || 0;
+    state.usageOut = ev.usageOut || 0;
+    state.turns = ev.turns || 0;
+    state.session = ev.session || "";
+    state.cwd = ev.cwd || "";
+    state.version = ev.version || "";
+    state.tools = ev.tools || [];
+    updateFooter();
+  }
+
+  // renderOpen repaints just the streaming block, so long transcripts do not
+  // flicker on every token.
+  function renderOpen() {
+    if (openAssistant < 0) { render(); return; }
+    var stickNow = nearestScroll() || stick;
+    var block = transcript.querySelector(".block.assistant:last-of-type pre");
+    if (!block) { render(); return; }
+    block.textContent = blocks[openAssistant].body;
+    if (stickNow) scrollToBottom();
+  }
+
+  function connect() {
+    var es = new EventSource("/api/events?token=" + encodeURIComponent(token));
+    es.onmessage = function (e) {
+      var ev;
+      try { ev = JSON.parse(e.data); } catch (err) { return; }
+      handle(ev);
+    };
+    es.onerror = function () {
+      // EventSource reconnects on its own; the server's snapshot resyncs us.
+      usageEl.textContent = "reconnecting…";
+    };
+  }
+
+  // ---- commands and input -------------------------------------------------
+
+  function submit() {
+    var text = input.value.trim();
+    if (!text) return;
+    input.value = "";
+    if (text.charAt(0) === "/") {
+      command(text);
+      return;
+    }
+    api("/api/prompt", { text: text }).catch(function (err) {
+      appendBlock({ kind: "error", title: "send failed", body: err.message, isError: true, done: true });
+    });
+  }
+
+  function command(text) {
+    var parts = text.slice(1).trim().split(/\s+/);
+    var cmd = (parts.shift() || "").toLowerCase();
+    var arg = parts.join(" ");
+    switch (cmd) {
+      case "help":
+      case "?":
+        appendBlock({ kind: "system", title: "help",
+          body: "commands:\n  /help              show this help\n  /model [name]      show or switch the model\n" +
+                "  /new               start a new session\n  /session           show the current session\n" +
+                "  /tools             list enabled tools\n  /clear             clear the transcript\n\n" +
+                "keys:\n  enter              send (queues while the agent is working)\n  shift+enter        newline\n  esc                abort the current run",
+          done: true });
+        break;
+      case "model":
+        if (!arg) { appendBlock({ kind: "system", title: "model", body: "current model: " + (state.model || "none"), done: true }); break; }
+        api("/api/model", { model: arg }).catch(function (err) {
+          appendBlock({ kind: "error", title: "model", body: err.message, isError: true, done: true });
+        });
+        break;
+      case "new":
+        api("/api/new").catch(function (err) {
+          appendBlock({ kind: "error", title: "new session", body: err.message, isError: true, done: true });
+        });
+        break;
+      case "session":
+        appendBlock({ kind: "system", title: "session", body: state.session || "no session (ephemeral mode)", done: true });
+        break;
+      case "tools":
+        appendBlock({ kind: "system", title: "tools", body: (state.tools || []).join(", ") || "(none)", done: true });
+        break;
+      case "clear":
+        api("/api/clear").catch(function () {});
+        break;
+      case "quit":
+      case "exit":
+        appendBlock({ kind: "system", body: "close the tab to quit; this is the web console", done: true });
+        break;
+      default:
+        appendBlock({ kind: "error", body: "unknown command: /" + cmd + " (try /help)", isError: true, done: true });
+    }
+  }
+
+  input.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && !e.shiftKey && !e.altKey && !e.ctrlKey) {
+      e.preventDefault();
+      submit();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      if (state.running) api("/api/abort").catch(function () {});
+    }
+  });
+  sendBtn.addEventListener("click", submit);
+  abortBtn.addEventListener("click", function () { api("/api/abort").catch(function () {}); });
+
+  updateFooter();
+  input.focus();
+  connect();
+})();
+</script>
+</body>
+</html>

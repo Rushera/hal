@@ -18,8 +18,8 @@ skill, package, and provider-matrix machinery.
 - **Terminal UI.** Startup header, scrollable transcript showing each tool call
   and its output, multi-line editor, and a footer with directory, model, session
   status, and token usage.
-- **Three interfaces:** interactive TUI, `--print` one-shot, and `--mode json`
-  for a machine-readable event stream.
+- **Four interfaces:** interactive TUI, `--web` browser console, `--print`
+  one-shot, and `--mode json` for a machine-readable event stream.
 - **JSONL sessions** with parent links, grouped per working directory, resumable
   with `-c`.
 - **OpenAI-compatible provider** — OpenAI, OpenRouter, Groq, Ollama, llama.cpp,
@@ -160,9 +160,35 @@ hal -p "summarize README.md"         # one-shot, prints the response
 cat main.go | hal -p "review this"   # pipe into a one-shot run
 hal -p @notes.md "extract the todos" # include a file
 hal --mode json "inspect this repo"  # JSONL event stream
+hal --web                            # browser console on 127.0.0.1:8080
 hal -c                               # resume the most recent session here
 hal --tools read,grep,find,ls -p "audit this repo"   # read-only run
 ```
+
+### Web console
+
+`--web` serves the same console in a browser instead of the terminal: the same
+agent, tools, sessions, and event stream, with a plain page (no ASCII art).
+`--web-addr` picks the listen address; it defaults to `127.0.0.1:8080` and
+stays on loopback unless you widen it.
+
+```
+$ hal --web
+hal web console: http://127.0.0.1:8080/?token=b20e4552…
+```
+
+The URL carries a random token generated at startup; every request must present
+it. That is what keeps a page on another origin from reaching the API through
+your browser's loopback access, since the console can run shell commands. The
+page is served from the binary, so there is no build step and no extra files.
+
+`xterm`-free transcript: user turns, streamed assistant text, each tool call
+with its output and duration, errors, and a footer with model, status, token
+usage, session, and turns. The editor supports the same slash commands as the
+TUI (`/help /model /new /session /tools /clear`); `enter` sends, `shift+enter`
+inserts a newline, `esc` aborts, and a prompt submitted while the agent is busy
+is queued. Server-sent events carry the stream; each reconnect resynchronises
+from a full snapshot, so a dropped connection never duplicates or loses blocks.
 
 ### Editor and keys
 

@@ -29,6 +29,7 @@ import (
 	"github.com/Rushera/hal/internal/session"
 	"github.com/Rushera/hal/internal/tools"
 	"github.com/Rushera/hal/internal/tui"
+	"github.com/Rushera/hal/internal/web"
 )
 
 const version = "0.1.0"
@@ -53,6 +54,8 @@ type options struct {
 	configPath   string
 	showConfig   bool
 	showVersion  bool
+	web          bool
+	webAddr      string
 	prompts      []string
 	files        []string
 }
@@ -192,6 +195,8 @@ func runWithArgs(args []string) error {
 	defer stop()
 
 	switch {
+	case opts.web:
+		return runWeb(ctx, ag, cwd, prompt, opts.sessionDir, sess, opts.webAddr)
 	case jsonMode:
 		return runJSON(ctx, ag, prompt)
 	case interactive:
@@ -235,6 +240,8 @@ func parseArgs(args []string) (options, map[string]bool, error) {
 	fs.BoolVar(&o.showConfig, "show-config", false, "print the resolved configuration and exit")
 	fs.BoolVar(&o.showVersion, "v", false, "print version and exit")
 	fs.BoolVar(&o.showVersion, "version", false, "print version and exit")
+	fs.BoolVar(&o.web, "web", false, "serve the console in a browser instead of the terminal")
+	fs.StringVar(&o.webAddr, "web-addr", "127.0.0.1:8080", "address for --web to listen on")
 
 	if err := fs.Parse(args); err != nil {
 		return o, nil, err
@@ -581,34 +588,63 @@ func runJSON(ctx context.Context, ag *agent.Agent, prompt string) error {
 	})
 }
 
+// sessionSummary describes an active session for the TUI/web footers.
+func sessionSummary(sess *session.Session) string {
+	return fmt.Sprintf("id %s · %s · %d messages", sess.ID, sess.Path, len(sess.Messages))
+}
+
+// sessionHooks returns the SessionInfo/NewSession callbacks shared by the
+// interactive terminal UI and the web console. When the console starts a fresh
+// session, both the agent and the (possibly replaced) session are rewired so
+// persistence keeps working.
+func sessionHooks(ag *agent.Agent, cwd, sessionDir string, sess *session.Session) (func() string, func() (string, error)) {
+	if sess == nil {
+		return nil, nil
+	}
+	info := func() string { return sessionSummary(sess) }
+	newSession := func() (string, error) {
+		ns, err := session.New(session.RootWith(sessionDir), cwd, "", ag.ModelName())
+		if err != nil {
+			return "", err
+		}
+		sess = ns
+		ag.SetSessionID(ns.ID)
+		ag.OnMessage = func(m agent.Message) { _ = ns.AppendMessage(m) }
+		info = func() string { return sessionSummary(ns) }
+		return "(session " + ns.ID[:8] + ")", nil
+	}
+	return info, newSession
+}
+
 func runInteractive(ag *agent.Agent, cwd, prompt, sessionDir string, sess *session.Session) error {
+	infoFn, newFn := sessionHooks(ag, cwd, sessionDir, sess)
 	opts := tui.Options{
 		Agent:         ag,
 		Cwd:           cwd,
 		Version:       version,
 		InitialPrompt: prompt,
-	}
-	if sess != nil {
-		opts.SessionInfo = func() string {
-			return fmt.Sprintf("id %s · %s · %d messages", sess.ID, sess.Path, len(sess.Messages))
-		}
-		opts.NewSession = func() (string, error) {
-			ns, err := session.New(session.RootWith(sessionDir), cwd, "", ag.ModelName())
-			if err != nil {
-				return "", err
-			}
-			sess = ns
-			ag.SetSessionID(ns.ID)
-			ag.OnMessage = func(m agent.Message) { _ = ns.AppendMessage(m) }
-			opts.SessionInfo = func() string {
-				return fmt.Sprintf("id %s · %s · %d messages", ns.ID, ns.Path, len(ns.Messages))
-			}
-			return "(session " + ns.ID[:8] + ")", nil
-		}
+		SessionInfo:   infoFn,
+		NewSession:    newFn,
 	}
 	p := tea.NewProgram(tui.New(opts))
 	_, err := p.Run()
 	return err
+}
+
+// runWeb serves the same console in a browser. The agent, tools, session and
+// event stream are shared with the terminal UI; only the rendering differs.
+func runWeb(ctx context.Context, ag *agent.Agent, cwd, prompt, sessionDir string, sess *session.Session, addr string) error {
+	infoFn, newFn := sessionHooks(ag, cwd, sessionDir, sess)
+	srv := web.New(web.Options{
+		Agent:         ag,
+		Cwd:           cwd,
+		Version:       version,
+		Context:       ctx,
+		InitialPrompt: prompt,
+		SessionInfo:   infoFn,
+		NewSession:    newFn,
+	})
+	return srv.ListenAndServe(ctx, addr)
 }
 
 func summarize(raw string) string {
@@ -641,6 +677,7 @@ modes:
   (default)            interactive terminal UI
   -p, --print          run the prompt, print the response, exit
   --mode json          stream agent events as JSON lines
+  --web                serve the console in a browser (see --web-addr)
 
 options:
   -c, --continue       continue the most recent session for this directory
@@ -659,6 +696,8 @@ options:
   --max-turns <n>      maximum agent turns per prompt (default 32)
   --config <path>      configuration file (default $XDG_CONFIG_HOME/hal/config.toml)
   --show-config        print the resolved configuration and exit
+  --web                serve the console in a browser instead of the terminal
+  --web-addr <addr>    address for --web to listen on (default 127.0.0.1:8080)
   -h, --help           show this help
   -v, --version        show the version
 
@@ -697,5 +736,6 @@ examples:
   hal -p @notes.md "extract the todos"  include a file
   hal --tools read,grep,find,ls -p "audit this repo"   read-only run
   hal -c                                resume the last session
+  hal --web                             serve the console in a browser
 `
 }
