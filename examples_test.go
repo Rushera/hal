@@ -42,6 +42,7 @@ func TestExampleConfigsAreSchemaAccurate(t *testing.T) {
 		BaseURL:            "https://api.openai.com/v1",
 		Tools:              "read,bash,edit,write,grep,find,ls",
 		MaxTurns:           32,
+		MaxRetries:         4,
 		AppendSystemPrompt: "Prefer small, focused changes and run the tests before finishing.",
 	}
 	got := tomlCfg.File

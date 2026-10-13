@@ -98,7 +98,7 @@ func TestLatestAndList(t *testing.T) {
 		t.Fatalf("Latest returned %s, want %s", latest, second.Path)
 	}
 
-	infos, err := List(root, cwd)
+	infos, err := List(root, cwd, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,8 +121,8 @@ func TestSessionsAreGroupedPerDirectory(t *testing.T) {
 	if _, err := New(root, a, "in-a", "m"); err != nil {
 		t.Fatal(err)
 	}
-	infosA, _ := List(root, a)
-	infosB, _ := List(root, b)
+	infosA, _ := List(root, a, false)
+	infosB, _ := List(root, b, false)
 	if len(infosA) != 1 {
 		t.Fatalf("expected 1 session for dir a, got %d", len(infosA))
 	}
@@ -174,7 +174,7 @@ func TestLatestInFindsNewestAcrossRoots(t *testing.T) {
 	primary := filepath.Join(home, "data", "hal", "sessions")
 	secondary := filepath.Join(home, "other-root")
 
-	if _, err := LatestIn([]string{primary, secondary}, cwd); err == nil {
+	if _, err := LatestIn([]string{primary, secondary}, cwd, false); err == nil {
 		t.Fatal("expected ErrNoSessions when nothing is stored")
 	}
 
@@ -188,7 +188,7 @@ func TestLatestInFindsNewestAcrossRoots(t *testing.T) {
 
 	oldPath := old.Path
 
-	found, err := LatestIn([]string{primary, secondary}, cwd)
+	found, err := LatestIn([]string{primary, secondary}, cwd, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +205,7 @@ func TestLatestInFindsNewestAcrossRoots(t *testing.T) {
 	_ = newer.AppendMessage(agent.NewUserMessage("new"))
 	_ = newer.Close()
 
-	found, err = LatestIn([]string{primary, secondary}, cwd)
+	found, err = LatestIn([]string{primary, secondary}, cwd, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,5 +256,66 @@ func TestFindByIDAcceptsFullAndShortIDs(t *testing.T) {
 	}
 	if _, err := FindByID(filepath.Join(root, "absent"), s.ID); err == nil {
 		t.Fatal("expected an error when the root does not exist")
+	}
+}
+
+func TestListAllFindsSessionsAcrossProjectBuckets(t *testing.T) {
+	root := t.TempDir()
+	a := t.TempDir()
+	b := t.TempDir()
+
+	inA, err := New(root, a, "in-a", "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = inA.AppendMessage(agent.NewUserMessage("hello"))
+	_ = inA.Close()
+
+	inB, err := New(root, b, "in-b", "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = inB.Close()
+
+	// The default listing is scoped to the working directory...
+	scoped, err := List(root, a, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scoped) != 1 || scoped[0].Path != inA.Path {
+		t.Fatalf("scoped list = %+v, want only %s", scoped, inA.Path)
+	}
+
+	// ...while all lists every bucket, still filtered by the recorded cwd when
+	// one is given.
+	all, err := List(root, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("expected 2 sessions across buckets, got %+v", all)
+	}
+	for _, info := range all {
+		if info.ID == "" || info.Name == "" {
+			t.Fatalf("entries must be loaded, not just stat'ed: %+v", info)
+		}
+	}
+
+	onlyA, err := List(root, a, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(onlyA) != 1 || onlyA[0].ID != inA.ID {
+		t.Fatalf("filtered list = %+v, want only %s", onlyA, inA.ID)
+	}
+}
+
+func TestListAllOnAMissingRootIsEmpty(t *testing.T) {
+	infos, err := List(filepath.Join(t.TempDir(), "absent"), "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(infos) != 0 {
+		t.Fatalf("expected no sessions, got %+v", infos)
 	}
 }

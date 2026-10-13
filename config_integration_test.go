@@ -7,7 +7,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Rushera/hal/internal/agent"
 	"github.com/Rushera/hal/internal/config"
+	"github.com/Rushera/hal/internal/session"
 )
 
 // isolateXDG points every XDG variable at a temp directory so tests never read
@@ -299,4 +301,169 @@ func TestValidateResolvedRejectsUnknownProviderFromConfig(t *testing.T) {
 	if !strings.Contains(err.Error(), "anthropic") {
 		t.Fatalf("error should name the provider: %v", err)
 	}
+}
+
+// TestListSessionsShowsTheConversationsForTheDirectory covers the CLI half of
+// session switching: the ids printed here are what --session accepts.
+func TestListSessionsShowsTheConversationsForTheDirectory(t *testing.T) {
+	isolateXDG(t)
+	workdir := t.TempDir()
+	other := t.TempDir()
+
+	first, err := session.New(session.RootWith(""), workdir, "the first task", "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = first.AppendMessage(agent.NewUserMessage("hello"))
+	_ = first.Close()
+
+	second, err := session.New(session.RootWith(""), workdir, "", "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = second.Close()
+
+	elsewhere, err := session.New(session.RootWith(""), other, "another project", "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = elsewhere.Close()
+
+	oldWd, _ := os.Getwd()
+	if err := os.Chdir(workdir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldWd)
+
+	out, err := captureStdout(t, func() error {
+		return runWithArgs([]string{"--list-sessions"})
+	})
+	if err != nil {
+		t.Fatalf("--list-sessions failed: %v", err)
+	}
+	// Newest first, and only this directory's sessions.
+	if i, j := strings.Index(out, second.ID[:8]), strings.Index(out, first.ID[:8]); i < 0 || j < 0 || i > j {
+		t.Fatalf("expected the newest session first, got:\n%s", out)
+	}
+	if !strings.Contains(out, "the first task") {
+		t.Fatalf("the stored name should be listed:\n%s", out)
+	}
+	if strings.Contains(out, elsewhere.ID[:8]) {
+		t.Fatalf("another directory's session must not be listed:\n%s", out)
+	}
+	if !strings.Contains(out, "hal --session") {
+		t.Fatalf("the listing should say how to resume:\n%s", out)
+	}
+}
+
+// TestContinueAllResumesAnyProjectSession covers the CLI switch that crosses
+// the per-directory grouping.
+func TestContinueAllResumesAnyProjectSession(t *testing.T) {
+	_, cfgHome, _ := isolateXDG(t)
+	other := t.TempDir()
+	workdir := t.TempDir()
+	mock := newMockServer(t, [][]string{textChunks("hello back")})
+
+	writeConfig(t, cfgHome, "config.toml", `
+model = "m"
+base_url = "`+mock.server.URL+`"
+api_key = "k"
+`)
+
+	// A conversation recorded under a different working directory...
+	stored, err := session.New(session.RootWith(""), other, "older", "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stored.AppendMessage(agent.NewUserMessage("what did we decide?")); err != nil {
+		t.Fatal(err)
+	}
+	if err := stored.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	oldWd, _ := os.Getwd()
+	if err := os.Chdir(workdir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldWd)
+
+	if _, err := captureStdout(t, func() error {
+		return runWithArgs([]string{"--continue-all", "-p", "carry on"})
+	}); err != nil {
+		t.Fatalf("--continue-all failed: %v", err)
+	}
+
+	// The resumed run must have sent the stored history, not start from zero.
+	if len(mock.requests) == 0 {
+		t.Fatal("no request reached the provider")
+	}
+	msgs, _ := mock.requests[0]["messages"].([]any)
+	if len(msgs) < 3 { // system + stored user + new user
+		t.Fatalf("the stored conversation was not resumed: %+v", msgs)
+	}
+	var carried bool
+	for _, raw := range msgs {
+		if m, ok := raw.(map[string]any); ok && m["content"] == "what did we decide?" {
+			carried = true
+		}
+	}
+	if !carried {
+		t.Fatalf("the stored message is missing from the request: %+v", msgs)
+	}
+}
+
+// TestMaxRetriesPrecedence covers the retry budget resolution: flag > config >
+// default, with 0 meaning "use the default".
+func TestMaxRetriesPrecedence(t *testing.T) {
+	_, cfgHome, _ := isolateXDG(t)
+
+	// Default when nothing is configured.
+	o, set, err := parseArgs(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load("", config.Resolve())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, sources := resolveOptions(o, set, cfg)
+	if resolved.maxRetries != agent.DefaultMaxRetries {
+		t.Fatalf("default max retries = %d", resolved.maxRetries)
+	}
+	if !hasSetting(sources, "max_retries", "default") {
+		t.Fatalf("source not reported: %+v", sources)
+	}
+
+	// From the config file.
+	writeConfig(t, cfgHome, "config.toml", "max_retries = 7\n")
+	cfg, err = config.Load("", config.Resolve())
+	if err != nil {
+		t.Fatal(err)
+	}
+	o, set, _ = parseArgs(nil)
+	resolved, sources = resolveOptions(o, set, cfg)
+	if resolved.maxRetries != 7 {
+		t.Fatalf("config max retries = %d, want 7", resolved.maxRetries)
+	}
+	if !hasSetting(sources, "max_retries", "config") {
+		t.Fatalf("source not reported: %+v", sources)
+	}
+
+	// The flag wins, including a negative value that disables retrying.
+	o, set, _ = parseArgs([]string{"--max-retries", "-1"})
+	resolved, _ = resolveOptions(o, set, cfg)
+	if resolved.maxRetries != -1 {
+		t.Fatalf("flag max retries = %d, want -1", resolved.maxRetries)
+	}
+}
+
+// hasSetting reports whether a source entry for key mentions the given origin.
+func hasSetting(sources []settingSource, key, origin string) bool {
+	for _, s := range sources {
+		if s.Key == key && strings.Contains(s.Source, origin) {
+			return true
+		}
+	}
+	return false
 }

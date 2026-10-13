@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/Rushera/hal/internal/agent"
+	"github.com/Rushera/hal/internal/session"
 )
 
 //go:embed index.html
@@ -87,9 +88,13 @@ type Options struct {
 	SessionID func() string
 	// NewSession starts a fresh session file and returns its description.
 	NewSession func() (string, error)
-	// OpenSession switches to a stored session by id. The page URL names the
-	// session it was opened in, so reloading a tab reopens that conversation.
-	OpenSession func(id string) error
+	// ListSessions reports the stored sessions that can be switched to, which
+	// is what the page's session menu offers.
+	ListSessions func() []session.Info
+	// OpenSession switches to a stored session by id and returns its
+	// description. The page URL names the session it was opened in, so
+	// reloading a tab reopens that conversation.
+	OpenSession func(id string) (string, error)
 }
 
 // Block is one entry of the transcript shown in the page.
@@ -122,11 +127,23 @@ type outEvent struct {
 	Turns    int    `json:"turns"`
 	Session  string `json:"session,omitempty"`
 	// SessionID is the current session's id, which the page keeps in its URL.
-	SessionID string   `json:"sessionId,omitempty"`
-	Cwd       string   `json:"cwd,omitempty"`
-	Version   string   `json:"version,omitempty"`
-	Tools     []string `json:"tools,omitempty"`
-	Blocks    []Block  `json:"blocks,omitempty"`
+	SessionID string `json:"sessionId,omitempty"`
+	// Sessions lists the switchable sessions; sent with "state" snapshots.
+	Sessions []sessionInfo `json:"sessions,omitempty"`
+	Cwd      string        `json:"cwd,omitempty"`
+	Version  string        `json:"version,omitempty"`
+	Tools    []string      `json:"tools,omitempty"`
+	Blocks   []Block       `json:"blocks,omitempty"`
+}
+
+// sessionInfo is one entry of the page's session menu.
+type sessionInfo struct {
+	ID        string `json:"id"`
+	Name      string `json:"name,omitempty"`
+	Model     string `json:"model,omitempty"`
+	Messages  int    `json:"messages"`
+	UpdatedAt string `json:"updatedAt,omitempty"`
+	Current   bool   `json:"current,omitempty"`
 }
 
 // Server holds the console state shared by every connected page.
@@ -291,6 +308,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/clear", s.auth(s.handleClear))
 	mux.HandleFunc("/api/new", s.auth(s.handleNew))
 	mux.HandleFunc("/api/model", s.auth(s.handleModel))
+	mux.HandleFunc("/api/sessions", s.auth(s.handleSessions))
+	mux.HandleFunc("/api/session/open", s.auth(s.handleOpen))
 	return mux
 }
 
@@ -336,20 +355,68 @@ func (s *Server) adoptSession(id string) {
 	if id == "" || s.opts.OpenSession == nil || id == s.SessionID() {
 		return
 	}
-	s.mu.Lock()
-	running := s.running
-	s.mu.Unlock()
-	if running {
-		return
-	}
-	if err := s.opts.OpenSession(id); err != nil {
+	if err := s.OpenSession(id); err != nil {
 		fmt.Fprintf(os.Stderr, "hal web: cannot open session %s: %v\n", id, err)
-		return
+	}
+}
+
+// OpenSession switches the console to another stored session: the agent is
+// rewired to it, the transcript is rebuilt, and every page is sent the new
+// snapshot. A turn in flight is aborted, together with its queued prompts, so
+// the turns of one conversation stay together.
+func (s *Server) OpenSession(id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return errors.New("no session id given")
+	}
+	if id == s.SessionID() {
+		return nil
+	}
+	if s.opts.OpenSession == nil {
+		return errors.New("sessions are disabled")
+	}
+	if running := s.abortForSwitch(); running {
+		// Let the aborted run finish before the history is replaced, so its
+		// remaining events cannot land in the session being opened.
+		for i := 0; i < 500 && s.isRunning(); i++ {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	desc, err := s.opts.OpenSession(id)
+	if err != nil {
+		return err
 	}
 	s.seedFromHistory()
 	s.mu.Lock()
+	if desc != "" {
+		s.blocks = append(s.blocks, Block{Kind: kindSystem, Body: "switched to session " + desc, Done: true})
+	}
 	s.broadcastLocked(s.statusLocked("state"))
 	s.mu.Unlock()
+	return nil
+}
+
+// abortForSwitch cancels the running turn and drops its queue, reporting
+// whether a turn was in flight. The cancellation is marked as an abort so the
+// session being opened does not inherit a "run failed" notice.
+func (s *Server) abortForSwitch() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.running {
+		return false
+	}
+	s.aborting = true
+	s.queued = nil
+	if s.cancel != nil {
+		s.cancel()
+	}
+	return true
+}
+
+func (s *Server) isRunning() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.running
 }
 
 // seedFromHistory replaces the transcript with one rebuilt from the conversation
@@ -491,6 +558,35 @@ func (s *Server) handleModel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// handleSessions answers with the switchable sessions, for a page that wants to
+// refresh the menu without reconnecting its event stream.
+func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	infos := s.sessionsLocked()
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"sessions": infos})
+}
+
+// handleOpen switches the console to another stored session.
+func (s *Server) handleOpen(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "use POST")
+		return
+	}
+	var body struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if err := s.OpenSession(strings.TrimSpace(body.ID)); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -613,8 +709,31 @@ func (s *Server) statusLocked(evType string) outEvent {
 	ev.SessionID = s.SessionID()
 	if evType == "state" {
 		ev.Blocks = append([]Block(nil), s.blocks...)
+		ev.Sessions = s.sessionsLocked()
 	}
 	return ev
+}
+
+// sessionsLocked builds the page's session menu; callers hold s.mu. The current
+// session is still listed, flagged, so the menu shows where the console is.
+func (s *Server) sessionsLocked() []sessionInfo {
+	if s.opts.ListSessions == nil {
+		return nil
+	}
+	infos := s.opts.ListSessions()
+	current := s.SessionID()
+	out := make([]sessionInfo, 0, len(infos))
+	for _, info := range infos {
+		out = append(out, sessionInfo{
+			ID:        info.ID,
+			Name:      info.Name,
+			Model:     info.Model,
+			Messages:  info.Messages,
+			UpdatedAt: info.UpdatedAt.Format(time.RFC3339),
+			Current:   info.ID == current,
+		})
+	}
+	return out
 }
 
 func (s *Server) snapshotEvent() outEvent {
@@ -726,6 +845,10 @@ func (s *Server) applyEvent(ev agent.Event) {
 		s.lastErr = errors.New(ev.Error)
 		s.blocks = append(s.blocks, Block{Kind: kindError, Title: "error", Body: ev.Error, IsError: true, Done: true})
 		out = outEvent{Type: "error", Title: "error", Text: ev.Error}
+	case agent.EventRetry:
+		body := fmt.Sprintf("%s — attempt %d of %d in %.1fs", ev.Error, ev.Attempt, ev.MaxAttempts, float64(ev.RetryInMS)/1000)
+		s.blocks = append(s.blocks, Block{Kind: kindSystem, Title: "retrying", Body: body, Done: true})
+		out = outEvent{Type: "system", Title: "retrying", Text: body}
 	}
 	if out.Type != "" {
 		s.broadcastLocked(out)

@@ -39,6 +39,8 @@ type options struct {
 	printMode    bool
 	mode         string
 	cont         bool
+	contAll      bool
+	listSessions bool
 	sessionPath  string
 	sessionDir   string
 	noSession    bool
@@ -52,6 +54,7 @@ type options struct {
 	systemPrompt string
 	appendPrompt string
 	maxTurns     int
+	maxRetries   int
 	configPath   string
 	showConfig   bool
 	showVersion  bool
@@ -105,6 +108,10 @@ func runWithArgs(args []string) error {
 		fmt.Println("hal " + version)
 		return nil
 	}
+	if opts.listSessions {
+		printSessions(session.RootWith(opts.sessionDir), cwdForList())
+		return nil
+	}
 
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -145,6 +152,7 @@ func runWithArgs(args []string) error {
 	if opts.maxTurns > 0 {
 		ag.MaxTurns = opts.maxTurns
 	}
+	ag.MaxRetries = opts.maxRetries
 
 	// Sessions: JSONL files under the XDG data directory, unless --no-session.
 	var sess *session.Session
@@ -157,10 +165,30 @@ func runWithArgs(args []string) error {
 				return fmt.Errorf("cannot load session %s: %w", opts.sessionPath, err)
 			}
 			ag.History = append([]agent.Message(nil), sess.Messages...)
+		case opts.contAll:
+			// --continue-all widens the search to sessions recorded for any
+			// project on this machine, which is what `-c --list` style switching
+			// needs when the working directory changed.
+			latest, lerr := session.LatestIn(session.SearchRoots(opts.sessionDir), "", true)
+			switch {
+			case errors.Is(lerr, session.ErrNoSessions):
+				sess, err = session.New(root, cwd, opts.name, prov.ModelName())
+				if err != nil {
+					return fmt.Errorf("cannot create session: %w", err)
+				}
+			case lerr != nil:
+				return lerr
+			default:
+				sess, err = session.Load(latest)
+				if err != nil {
+					return fmt.Errorf("cannot load session %s: %w", latest, err)
+				}
+				ag.History = append([]agent.Message(nil), sess.Messages...)
+			}
 		case opts.cont:
 			// Continuing with nothing stored yet starts a fresh session instead of
 			// failing, so "hal --web -c" works on the first run of a directory.
-			latest, lerr := session.LatestIn(session.SearchRoots(opts.sessionDir), cwd)
+			latest, lerr := session.LatestIn(session.SearchRoots(opts.sessionDir), cwd, false)
 			switch {
 			case errors.Is(lerr, session.ErrNoSessions):
 				sess, err = session.New(root, cwd, opts.name, prov.ModelName())
@@ -230,6 +258,8 @@ func parseArgs(args []string) (options, map[string]bool, error) {
 	fs.StringVar(&o.mode, "mode", "", "output mode: text or json")
 	fs.BoolVar(&o.cont, "c", false, "continue the most recent session for this directory")
 	fs.BoolVar(&o.cont, "continue", false, "continue the most recent session for this directory")
+	fs.BoolVar(&o.contAll, "continue-all", false, "continue the most recent session for this directory or any other on this machine")
+	fs.BoolVar(&o.listSessions, "list-sessions", false, "list the stored sessions and exit")
 	fs.StringVar(&o.sessionPath, "session", "", "session file to open")
 	fs.StringVar(&o.sessionDir, "session-dir", "", "session storage directory (default $XDG_DATA_HOME/hal/sessions)")
 	fs.BoolVar(&o.noSession, "no-session", false, "do not save the session")
@@ -247,6 +277,7 @@ func parseArgs(args []string) (options, map[string]bool, error) {
 	fs.StringVar(&o.systemPrompt, "system-prompt", "", "replace the default system prompt")
 	fs.StringVar(&o.appendPrompt, "append-system-prompt", "", "append text to the system prompt")
 	fs.IntVar(&o.maxTurns, "max-turns", 32, "maximum agent turns per prompt")
+	fs.IntVar(&o.maxRetries, "max-retries", agent.DefaultMaxRetries, "retries for a transient provider failure (negative disables)")
 	fs.StringVar(&o.configPath, "config", "", "configuration file (default $XDG_CONFIG_HOME/hal/config.toml)")
 	fs.BoolVar(&o.showConfig, "show-config", false, "print the resolved configuration and exit")
 	fs.BoolVar(&o.showVersion, "v", false, "print version and exit")
@@ -391,6 +422,16 @@ func resolveOptions(o options, set map[string]bool, cfg config.Loaded) (options,
 	o.apiKey = pickString("api_key", o.apiKey, []string{"api-key"}, keyEnvNames, cfg.File.APIKey, "")
 	o.toolList = pickString("tools", o.toolList, []string{"tools", "t"}, nil, cfg.File.Tools, "")
 	o.maxTurns = pickInt("max_turns", o.maxTurns, []string{"max-turns"}, cfg.File.MaxTurns, 32)
+	// Retries are read raw: 0 means "use the built-in default", so it must not
+	// be mistaken for a value that was set.
+	if anyFlagSet(set, "max-retries") {
+		sources = append(sources, settingSource{"max_retries", fmt.Sprint(o.maxRetries), "flag"})
+	} else if cfg.File.MaxRetries != 0 {
+		o.maxRetries = cfg.File.MaxRetries
+		sources = append(sources, settingSource{"max_retries", fmt.Sprint(cfg.File.MaxRetries), "config " + cfg.Path})
+	} else {
+		sources = append(sources, settingSource{"max_retries", fmt.Sprint(agent.DefaultMaxRetries), "default"})
+	}
 	o.systemPrompt = pickString("system_prompt", o.systemPrompt, []string{"system-prompt"}, nil, cfg.File.SystemPrompt, "")
 	o.appendPrompt = pickString("append_system_prompt", o.appendPrompt, []string{"append-system-prompt"}, nil, cfg.File.AppendSystemPrompt, "")
 	o.sessionDir = pickString("session_dir", o.sessionDir, []string{"session-dir"},
@@ -412,6 +453,39 @@ func boolText(v bool) string {
 		return "true"
 	}
 	return "false"
+}
+
+// cwdForList is the working directory --list-sessions filters on, or "" when it
+// cannot be determined (in which case every stored session is listed).
+func cwdForList() string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	return cwd
+}
+
+// printSessions lists the conversations stored for a directory, newest first,
+// with the id needed to resume one with --session.
+func printSessions(root, cwd string) {
+	infos, err := session.List(root, cwd, false)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "hal: cannot list sessions: %v\n", err)
+		return
+	}
+	if len(infos) == 0 {
+		fmt.Printf("no stored sessions for %s\n", cwd)
+		fmt.Printf("  (session dir: %s)\n", root)
+		return
+	}
+	fmt.Printf("%d session(s) for %s:\n\n", len(infos), cwd)
+	for _, info := range infos {
+		fmt.Printf("  %-10s %s\n", shortSessionID(info.ID), sessionLabel(info))
+		if info.Model != "" {
+			fmt.Printf("  %-10s   model %s\n", "", info.Model)
+		}
+	}
+	fmt.Printf("\nresume with: hal --session <id>\n")
 }
 
 // printConfig shows the resolved settings and where each value came from.
@@ -587,6 +661,9 @@ func runPrint(ctx context.Context, ag *agent.Agent, prompt string, out, errOut i
 			}
 		case agent.EventError:
 			fmt.Fprintln(errOut, "hal: "+ev.Error)
+		case agent.EventRetry:
+			fmt.Fprintf(errOut, "hal: transient failure, retrying (attempt %d of %d in %.1fs): %s\n",
+				ev.Attempt, ev.MaxAttempts, float64(ev.RetryInMS)/1000, ev.Error)
 		}
 	})
 	if emitted {
@@ -607,26 +684,46 @@ func runJSON(ctx context.Context, ag *agent.Agent, prompt string) error {
 
 // sessionSummary describes an active session for the TUI/web footers.
 func sessionSummary(sess *session.Session) string {
-	return fmt.Sprintf("id %s · %s · %d messages", sess.ID, sess.Path, len(sess.Messages))
+	return fmt.Sprintf("id %s · %s · %d messages", shortSessionID(sess.ID), sess.Path, len(sess.Messages))
+}
+
+// sessionLabel is the one-line description of a stored session used by the
+// session switcher: the first thing about it a person would recognise.
+func sessionLabel(info session.Info) string {
+	name := strings.TrimSpace(info.Name)
+	body := fmt.Sprintf("%d msgs · %s", info.Messages, info.UpdatedAt.Format("2006-01-02 15:04"))
+	if name != "" {
+		return fmt.Sprintf("%s — %s (%s)", shortSessionID(info.ID), name, body)
+	}
+	return fmt.Sprintf("%s (%s)", shortSessionID(info.ID), body)
+}
+
+func shortSessionID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
 }
 
 // sessionCallbacks are the session controls the TUI and the web console share.
 // Each one reads the session variable they close over, so replacing the session
-// (a new one, or one reopened from a page URL) keeps all of them in step.
+// (a new one, or one reopened from a stored id) keeps all of them in step.
 type sessionCallbacks struct {
 	// Info describes the session for the footer.
 	Info func() string
 	// ID reports the session id, or "" when sessions are disabled.
 	ID func() string
+	// List reports the stored sessions that can be switched to, newest first.
+	List func() []session.Info
 	// New starts a fresh session file.
 	New func() (string, error)
-	// Open switches to the stored session with the given id.
-	Open func(id string) error
+	// Open switches to the stored session with the given id and describes it.
+	Open func(id string) (string, error)
 }
 
 // sessionHooks returns the callbacks shared by the interactive terminal UI and
-// the web console. When the console starts or reopens a session, the agent and
-// the (possibly replaced) session are rewired so persistence keeps working.
+// the web console. When either starts or reopens a session, the agent and the
+// (possibly replaced) session are rewired so persistence keeps working.
 func sessionHooks(ag *agent.Agent, cwd, sessionDir string, sess *session.Session) sessionCallbacks {
 	if sess == nil {
 		return sessionCallbacks{Info: func() string { return "" }, ID: func() string { return "" }}
@@ -643,6 +740,15 @@ func sessionHooks(ag *agent.Agent, cwd, sessionDir string, sess *session.Session
 		}
 		return sess.ID
 	}
+	// The switcher shows every session stored for this directory, whatever
+	// project bucket the file happens to live in.
+	list := func() []session.Info {
+		infos, err := session.List(session.RootWith(sessionDir), cwd, true)
+		if err != nil {
+			return nil
+		}
+		return infos
+	}
 	adopt := func(ns *session.Session) {
 		sess = ns
 		ag.History = append([]agent.Message(nil), ns.Messages...)
@@ -657,24 +763,24 @@ func sessionHooks(ag *agent.Agent, cwd, sessionDir string, sess *session.Session
 			return "", err
 		}
 		adopt(ns)
-		return "(session " + ns.ID[:8] + ")", nil
+		return "(session " + shortSessionID(ns.ID) + ")", nil
 	}
-	openSession := func(want string) error {
+	openSession := func(want string) (string, error) {
 		path, err := session.FindByID(session.RootWith(sessionDir), want)
 		if err != nil {
-			return err
+			return "", err
 		}
 		ns, err := session.Load(path)
 		if err != nil {
-			return err
+			return "", err
 		}
 		if sess != nil {
 			_ = sess.Close()
 		}
 		adopt(ns)
-		return nil
+		return "(session " + shortSessionID(ns.ID) + " · " + fmt.Sprintf("%d messages", len(ns.Messages)) + ")", nil
 	}
-	return sessionCallbacks{Info: info, ID: id, New: newSession, Open: openSession}
+	return sessionCallbacks{Info: info, ID: id, List: list, New: newSession, Open: openSession}
 }
 
 func runInteractive(ag *agent.Agent, cwd, prompt, sessionDir string, sess *session.Session) error {
@@ -685,7 +791,10 @@ func runInteractive(ag *agent.Agent, cwd, prompt, sessionDir string, sess *sessi
 		Version:       version,
 		InitialPrompt: prompt,
 		SessionInfo:   cbs.Info,
+		SessionID:     cbs.ID,
 		NewSession:    cbs.New,
+		ListSessions:  cbs.List,
+		OpenSession:   cbs.Open,
 	}
 	p := tea.NewProgram(tui.New(opts))
 	_, err := p.Run()
@@ -704,6 +813,7 @@ func runWeb(ctx context.Context, ag *agent.Agent, cwd, prompt, sessionDir string
 		InitialPrompt: prompt,
 		SessionInfo:   cbs.Info,
 		SessionID:     cbs.ID,
+		ListSessions:  cbs.List,
 		NewSession:    cbs.New,
 		OpenSession:   cbs.Open,
 		Token:         token,
@@ -749,6 +859,8 @@ modes:
 options:
   -c, --continue       continue the most recent session for this directory
                        (start a new one when there is nothing to continue)
+  --continue-all       continue the most recent session for this directory or
+                       any other recorded for this machine
   --session <path>     open a specific session file
   --no-session         do not persist the session
   -n, --name <name>    session display name
@@ -762,6 +874,8 @@ options:
   --system-prompt <text|file>       replace the default system prompt
   --append-system-prompt <text|file> append to the system prompt
   --max-turns <n>      maximum agent turns per prompt (default 32)
+  --max-retries <n>    retries for a transient provider failure such as a
+                       reset connection or a 429 (default 4, negative disables)
   --config <path>      configuration file (default $XDG_CONFIG_HOME/hal/config.toml)
   --show-config        print the resolved configuration and exit
   --web                serve the console in a browser instead of the terminal
@@ -783,6 +897,7 @@ configuration file:
     api_key_env = ""              # or name a variable, e.g. GATEWAY_API_KEY
     tools    = "read,edit"        # comma-separated allowlist
     max_turns = 32
+    max_retries = 4               # 0 = default, negative = never retry
     system_prompt = ""            # text, or a path to a file
     no_context_files = false
     session_dir = ""              # default $XDG_DATA_HOME/hal/sessions
@@ -808,6 +923,7 @@ examples:
   hal -p @notes.md "extract the todos"  include a file
   hal --tools read,grep,find,ls -p "audit this repo"   read-only run
   hal -c                                resume the last session
+  hal --continue-all                    resume the last session for the machine
   hal --web                             serve the console in a browser
 `
 }

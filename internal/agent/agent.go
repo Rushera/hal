@@ -10,6 +10,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"runtime"
 	"strings"
@@ -33,6 +34,8 @@ const (
 	EventUsage      = "usage"
 	EventDone       = "done"
 	EventError      = "error"
+	// EventRetry reports that a transient provider failure is being retried.
+	EventRetry = "retry"
 )
 
 // MaxToolResultChars caps a single tool result before it is fed back to the
@@ -117,6 +120,10 @@ type Event struct {
 	Message  *Message    `json:"message,omitempty"`
 	Usage    *Usage      `json:"usage,omitempty"`
 	Error    string      `json:"error,omitempty"`
+	// Retry fields describe a transient failure being retried (EventRetry).
+	Attempt     int `json:"attempt,omitempty"`
+	MaxAttempts int `json:"maxAttempts,omitempty"`
+	RetryInMS   int `json:"retryInMs,omitempty"`
 }
 
 // Agent drives the loop.
@@ -126,6 +133,15 @@ type Agent struct {
 	SystemPrompt string
 	History      []Message
 	MaxTurns     int
+	// MaxRetries is how many times a transient provider failure (a reset
+	// connection, a 429, a 5xx) is retried before the turn fails. Zero means
+	// DefaultMaxRetries; a negative value disables retrying.
+	MaxRetries int
+	// RetryBaseDelay is the first backoff step; it doubles per attempt. Zero
+	// means DefaultRetryBaseDelay.
+	RetryBaseDelay time.Duration
+	// Sleep waits between retries. It is a field so tests do not wait.
+	Sleep func(context.Context, time.Duration) error
 	// OnEvent receives every event; never nil after New.
 	OnEvent func(Event)
 	// OnMessage receives every message appended to the history, which is how
@@ -133,15 +149,59 @@ type Agent struct {
 	OnMessage func(Message)
 }
 
+// Retry policy defaults for transient provider failures.
+const (
+	DefaultMaxRetries     = 4
+	DefaultRetryBaseDelay = 500 * time.Millisecond
+	maxRetryDelay         = 10 * time.Second
+)
+
+// RetryableError marks a provider failure that is worth retrying, with an
+// optional delay the server asked for (Retry-After). Providers wrap transient
+// failures (a reset connection, a 429, a 5xx) in it; the agent loop decides how
+// many times to retry and how long to wait.
+type RetryableError struct {
+	Err        error
+	RetryAfter time.Duration
+}
+
+func (e *RetryableError) Error() string { return e.Err.Error() }
+func (e *RetryableError) Unwrap() error { return e.Err }
+
 // New creates an agent computing a default system prompt for the working
 // directory.
 func New(p Provider, t []Tool, cwd string, extraPrompt string) *Agent {
 	sys := BuildSystemPrompt(cwd, extraPrompt)
-	a := &Agent{Provider: p, Tools: t, SystemPrompt: sys, MaxTurns: 32, OnEvent: func(Event) {}}
+	a := &Agent{
+		Provider:       p,
+		Tools:          t,
+		SystemPrompt:   sys,
+		MaxTurns:       32,
+		MaxRetries:     DefaultMaxRetries,
+		RetryBaseDelay: DefaultRetryBaseDelay,
+		Sleep:          sleepCtx,
+		OnEvent:        func(Event) {},
+	}
 	if p != nil {
 		a.Provider = p
 	}
 	return a
+}
+
+// sleepCtx waits for d, or returns early when the context is cancelled, so an
+// abort during a retry backoff stops the turn promptly.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 func nowMilli() string { return time.Now().UTC().Format(time.RFC3339Nano) }
@@ -235,7 +295,7 @@ func (a *Agent) RunPrompt(ctx context.Context, prompt string, emit func(Event)) 
 		}
 
 		var streamed strings.Builder
-		assistant, err := a.Provider.Stream(ctx, a.requestMessages(), a.toolSpecs(), func(delta string) {
+		assistant, err := a.streamWithRetry(ctx, emit, func(delta string) {
 			streamed.WriteString(delta)
 			emit(Event{Type: EventTextDelta, Text: delta})
 		})
@@ -282,6 +342,77 @@ func (a *Agent) RunPrompt(ctx context.Context, prompt string, emit func(Event)) 
 	err := fmt.Errorf("agent stopped after %d turns without a final answer", maxTurns)
 	emit(Event{Type: EventError, Error: err.Error()})
 	return err
+}
+
+// maxRetries returns the effective retry budget.
+func (a *Agent) maxRetries() int {
+	if a.MaxRetries < 0 {
+		return 0
+	}
+	if a.MaxRetries == 0 {
+		return DefaultMaxRetries
+	}
+	return a.MaxRetries
+}
+
+func (a *Agent) retryBaseDelay() time.Duration {
+	if a.RetryBaseDelay <= 0 {
+		return DefaultRetryBaseDelay
+	}
+	return a.RetryBaseDelay
+}
+
+// streamWithRetry asks the provider for the next assistant message, retrying
+// transient failures (a connection reset, a 429, a 5xx) with exponential
+// backoff. A permanent failure, a cancelled context, and a failure that happened
+// after part of the answer had already been streamed are returned immediately:
+// retrying those would duplicate the text the user has already seen.
+func (a *Agent) streamWithRetry(ctx context.Context, emit func(Event), onText func(string)) (Message, error) {
+	max := a.maxRetries()
+	delay := a.retryBaseDelay()
+	for attempt := 0; ; attempt++ {
+		var streamed strings.Builder
+		msg, err := a.Provider.Stream(ctx, a.requestMessages(), a.toolSpecs(), func(delta string) {
+			streamed.WriteString(delta)
+			onText(delta)
+		})
+		if err == nil {
+			return msg, nil
+		}
+		if streamed.Len() > 0 {
+			return msg, fmt.Errorf("%w (the answer was cut off after %d characters)", err, streamed.Len())
+		}
+
+		var retryable *RetryableError
+		if attempt >= max || ctx.Err() != nil || !errors.As(err, &retryable) {
+			return msg, err
+		}
+
+		wait := delay
+		if retryable.RetryAfter > 0 {
+			wait = retryable.RetryAfter
+		}
+		if wait > maxRetryDelay {
+			wait = maxRetryDelay
+		}
+		emit(Event{
+			Type:        EventRetry,
+			Error:       err.Error(),
+			Attempt:     attempt + 1,
+			MaxAttempts: max,
+			RetryInMS:   int(wait / time.Millisecond),
+		})
+		sleep := a.Sleep
+		if sleep == nil {
+			sleep = sleepCtx
+		}
+		if serr := sleep(ctx, wait); serr != nil {
+			return msg, serr
+		}
+		if delay < maxRetryDelay {
+			delay *= 2
+		}
+	}
 }
 
 func (a *Agent) append(m Message, emit func(Event)) {

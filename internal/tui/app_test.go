@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/Rushera/hal/internal/agent"
+	"github.com/Rushera/hal/internal/session"
 )
 
 // fakeAgent is a scripted stand-in for *agent.Agent.
@@ -22,6 +23,7 @@ type fakeAgent struct {
 	model    string
 	aborted  bool
 	failWith error
+	history  []agent.Message
 }
 
 func (f *fakeAgent) RunPrompt(ctx context.Context, prompt string, emit func(agent.Event)) error {
@@ -59,9 +61,21 @@ func (f *fakeAgent) ModelName() string {
 }
 func (f *fakeAgent) SetModelName(m string) bool { f.mu.Lock(); f.model = m; f.mu.Unlock(); return true }
 func (f *fakeAgent) ProviderName() string       { return "fake" }
-func (f *fakeAgent) Messages() []agent.Message  { return nil }
-func (f *fakeAgent) Reset()                     {}
 func (f *fakeAgent) ToolNames() []string        { return []string{"read", "bash", "edit", "write"} }
+
+func (f *fakeAgent) Messages() []agent.Message {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]agent.Message(nil), f.history...)
+}
+
+func (f *fakeAgent) Reset() { f.mu.Lock(); f.history = nil; f.mu.Unlock() }
+
+func (f *fakeAgent) setHistory(msgs ...agent.Message) {
+	f.mu.Lock()
+	f.history = msgs
+	f.mu.Unlock()
+}
 
 func (f *fakeAgent) promptCount() int {
 	f.mu.Lock()
@@ -354,5 +368,248 @@ func TestSummarizeArgs(t *testing.T) {
 		if got != want {
 			t.Fatalf("summarizeArgs(%s) = %q, want %q", raw, got, want)
 		}
+	}
+}
+
+// sessionInfo builds a stored-session entry for the switcher tests.
+func sessionEntry(id, name string) session.Info {
+	return session.Info{
+		ID: id, Name: name, Model: "fake-model", Messages: 2,
+		UpdatedAt: time.Date(2026, 10, 12, 9, 30, 0, 0, time.UTC),
+	}
+}
+
+// withSessions wires the session callbacks the switcher uses onto a test model.
+func withSessions(m *Model, current string, infos ...session.Info) *Model {
+	m.opts.SessionID = func() string { return current }
+	m.opts.SessionInfo = func() string { return "id " + current }
+	m.opts.ListSessions = func() []session.Info { return infos }
+	m.opts.OpenSession = func(id string) (string, error) {
+		current = id
+		return "(session " + id[:8] + " · 1 messages)", nil
+	}
+	return m
+}
+
+func press(t *testing.T, m *Model, key string) *Model {
+	t.Helper()
+	var tm tea.Model = m
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+	return tm.(*Model)
+}
+
+func pressKey(t *testing.T, m *Model, k tea.KeyType) *Model {
+	t.Helper()
+	var tm tea.Model = m
+	tm, _ = tm.Update(tea.KeyMsg{Type: k})
+	return tm.(*Model)
+}
+
+func TestSwitchCommandOpensThePickerAndSwitches(t *testing.T) {
+	fa := &fakeAgent{}
+	m, _ := newTestModel(t, fa)
+	m = withSessions(m, "aaaa000011112222", sessionEntry("bbbb111122223333", "older task"))
+	fa.setHistory(agent.NewUserMessage("from bbbb"))
+
+	m, _ = typeAndEnter(t, m, "/switch")
+	if !m.picking {
+		t.Fatalf("/switch should open the picker:\n%s", m.View())
+	}
+	view := m.View()
+	if !strings.Contains(view, "switch session") || !strings.Contains(view, "bbbb1111") {
+		t.Fatalf("picker not rendered:\n%s", view)
+	}
+	if !strings.Contains(view, "older task") {
+		t.Fatalf("picker should show the stored name:\n%s", view)
+	}
+
+	m = pressKey(t, m, tea.KeyEnter)
+	if m.picking {
+		t.Fatal("picking should end after a selection")
+	}
+	if got := m.sessionID(); got != "bbbb111122223333" {
+		t.Fatalf("session not switched: %q", got)
+	}
+	view = m.View()
+	if !strings.Contains(view, "from bbbb") {
+		t.Fatalf("switched conversation not replayed:\n%s", view)
+	}
+	if !strings.Contains(view, "switched session") {
+		t.Fatalf("switch not reported:\n%s", view)
+	}
+}
+
+func TestPickerNavigatesAndCancels(t *testing.T) {
+	fa := &fakeAgent{}
+	m, _ := newTestModel(t, fa)
+	m = withSessions(m, "current0", sessionEntry("aaaa000011112222", "one"),
+		sessionEntry("bbbb111122223333", "two"), sessionEntry("cccc222233334444", "three"))
+
+	m, _ = typeAndEnter(t, m, "/sessions")
+	if !m.picking {
+		t.Fatal("/sessions without a stored list should still open the picker")
+	}
+	if m.selected != 0 {
+		t.Fatalf("selected = %d, want the first entry", m.selected)
+	}
+	m = press(t, m, "j")
+	if m.selected != 1 {
+		t.Fatalf("j should move down, selected = %d", m.selected)
+	}
+	m = pressKey(t, m, tea.KeyUp)
+	if m.selected != 0 {
+		t.Fatalf("up should move back, selected = %d", m.selected)
+	}
+	// wrap-around keeps the list navigable
+	m = pressKey(t, m, tea.KeyUp)
+	if m.selected != 2 {
+		t.Fatalf("up from the first entry should wrap, selected = %d", m.selected)
+	}
+
+	m = pressKey(t, m, tea.KeyEsc)
+	if m.picking {
+		t.Fatal("esc should close the picker")
+	}
+	if got := m.sessionID(); got != "current0" {
+		t.Fatalf("cancelling must not switch sessions: %q", got)
+	}
+}
+
+func TestSwitchToIDReplaysTheStoredConversation(t *testing.T) {
+	fa := &fakeAgent{}
+	m, _ := newTestModel(t, fa)
+	m = withSessions(m, "aaaa000011112222", sessionEntry("bbbb111122223333", "older"))
+	fa.setHistory(
+		agent.NewUserMessage("list the files"),
+		agent.Message{Role: agent.RoleAssistant, Content: "here you go", ToolCalls: []agent.ToolCall{
+			{ID: "1", Name: "ls", Arguments: `{"path":"."}`},
+		}},
+		agent.Message{Role: agent.RoleTool, ToolCallID: "1", Content: "main.go"},
+		agent.Message{Role: agent.RoleAssistant, Content: "done"},
+	)
+
+	m, _ = typeAndEnter(t, m, "/switch bbbb1111")
+	if m.picking {
+		t.Fatal("/switch with an id should switch directly, not open the picker")
+	}
+	view := m.View()
+	for _, want := range []string{"list the files", "here you go", "done", "ls(.)", "switched session"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("switched transcript missing %q:\n%s", want, view)
+		}
+	}
+	if m.turns != 0 || m.usageIn != 0 || m.usageOut != 0 {
+		t.Fatalf("the new session's counters should start at zero: %d %d %d", m.turns, m.usageIn, m.usageOut)
+	}
+}
+
+func TestSwitchReportsOpenFailures(t *testing.T) {
+	fa := &fakeAgent{}
+	m, _ := newTestModel(t, fa)
+	m.opts.SessionID = func() string { return "aaaa000011112222" }
+	m.opts.OpenSession = func(string) (string, error) { return "", errors.New("no such session") }
+
+	m, _ = typeAndEnter(t, m, "/switch deadbeef")
+	if !strings.Contains(m.View(), "no such session") {
+		t.Fatalf("the failure should be reported:\n%s", m.View())
+	}
+}
+
+func TestPickerSkipsTheCurrentSessionAndSaysWhenThereIsNothingElse(t *testing.T) {
+	fa := &fakeAgent{}
+	m, _ := newTestModel(t, fa)
+	m = withSessions(m, "aaaa000011112222", sessionEntry("aaaa000011112222", "current"))
+
+	m, _ = typeAndEnter(t, m, "/switch")
+	if m.picking {
+		t.Fatal("a picker with no other session should not open")
+	}
+	if !strings.Contains(m.View(), "no other sessions") {
+		t.Fatalf("the empty picker should say so:\n%s", m.View())
+	}
+}
+
+func TestSwitchWithoutSessionCallbacksIsReported(t *testing.T) {
+	fa := &fakeAgent{}
+	m, _ := newTestModel(t, fa)
+
+	m, _ = typeAndEnter(t, m, "/switch")
+	if m.picking {
+		t.Fatal("the picker must not open when sessions are disabled")
+	}
+	if !strings.Contains(m.View(), "--no-session") {
+		t.Fatalf("disabled sessions should be explained:\n%s", m.View())
+	}
+}
+
+func TestNewCommandDropsQueuedAndRepaintsTheEditor(t *testing.T) {
+	fa := &fakeAgent{blocking: true}
+	m, ch := newTestModel(t, fa)
+
+	m, _ = typeAndEnter(t, m, "first")
+	m, _ = typeAndEnter(t, m, "second")
+	if len(m.queued) != 1 {
+		t.Fatalf("queued = %v, want the second prompt", m.queued)
+	}
+
+	m, _ = typeAndEnter(t, m, "/new")
+	if len(m.queued) != 0 {
+		t.Fatalf("/new should drop the queue, got %v", m.queued)
+	}
+	if !strings.Contains(m.View(), "› ") {
+		t.Fatalf("the editor should come back after /new:\n%s", m.View())
+	}
+	if fa.wasAborted() {
+		t.Fatal("starting a session must not abort the running turn")
+	}
+	// drain the run so the test does not leave a goroutine blocked
+	if m.cancel != nil {
+		m.cancel()
+	}
+	pump(t, m, ch)
+}
+
+func TestRetryIsShownInTheTranscript(t *testing.T) {
+	fa := &fakeAgent{script: []agent.Event{
+		{Type: agent.EventRetry, Error: "read: connection reset by peer",
+			Attempt: 2, MaxAttempts: 4, RetryInMS: 1500},
+		{Type: agent.EventTextDelta, Text: "recovered"},
+		{Type: agent.EventDone},
+	}}
+	m, ch := newTestModel(t, fa)
+	m, _ = typeAndEnter(t, m, "do it")
+	m = pump(t, m, ch)
+
+	view := m.View()
+	if !strings.Contains(view, "retrying") || !strings.Contains(view, "connection reset") {
+		t.Fatalf("the retry should be shown:\n%s", view)
+	}
+	if !strings.Contains(view, "attempt 2 of 4") {
+		t.Fatalf("the attempt count should be shown:\n%s", view)
+	}
+	if strings.Contains(view, "run failed") {
+		t.Fatalf("a retry is not a failure:\n%s", view)
+	}
+	if m.lastErr != nil {
+		t.Fatalf("a retry must not be recorded as the last error: %v", m.lastErr)
+	}
+}
+
+func TestSwitchingWhileRunningIsNotReportedAsAFailure(t *testing.T) {
+	fa := &fakeAgent{blocking: true}
+	m, ch := newTestModel(t, fa)
+	m.opts.SessionID = func() string { return "aaaa000011112222" }
+	m.opts.OpenSession = func(id string) (string, error) { return "(session " + id[:8] + ")", nil }
+
+	m, _ = typeAndEnter(t, m, "long task")
+	m, _ = typeAndEnter(t, m, "/switch bbbb1111")
+	m = pump(t, m, ch)
+
+	view := m.View()
+	if strings.Contains(view, "run failed") {
+		t.Fatalf("the abort a switch causes must not be reported as a failure:\n%s", view)
+	}
+	if !strings.Contains(view, "switched session") {
+		t.Fatalf("the switch should still be reported:\n%s", view)
 	}
 }

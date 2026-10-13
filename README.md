@@ -77,6 +77,7 @@ base_url = "https://api.openai.com/v1"
 api_key  = ""                  # prefer the HAL_API_KEY environment variable
 tools    = "read,bash,edit,write,grep,find,ls"
 max_turns = 32
+max_retries = 4                # 0 = default, negative = never retry a transient failure
 
 system_prompt        = ""      # text, or a path to a file
 append_system_prompt = ""
@@ -167,6 +168,35 @@ hal -c                               # resume the most recent session here
 hal --tools read,grep,find,ls -p "audit this repo"   # read-only run
 ```
 
+### Session switching
+
+Conversations are stored per working directory, and a running console can switch
+between them without restarting:
+
+- **In the TUI**, `/switch` opens a picker of the sessions stored for the
+  directory (newest first, with the current one flagged); `↑`/`↓` choose, `enter`
+  opens, `esc` cancels. `/switch <id>` opens one directly, and `/sessions` lists
+  them. Switching aborts a turn that is in flight and replays the conversation
+  it switched to (tool output is not part of the history, so those blocks come
+  back as calls without their results).
+- **In the web console**, the menu in the header lists the same sessions; the
+  footer keeps showing the current one. `/switch <id>` and `/sessions` work
+  there too. Because the session id is in the URL, reloading a tab reopens the
+  conversation it was showing.
+- **From the CLI**, `hal --list-sessions` prints the stored conversations with
+  the ids `--session` accepts, and `hal -c` / `hal --continue-all` resume the
+  most recent one for the directory or for the whole machine.
+
+```
+$ hal --list-sessions
+2 session(s) for /work/project:
+
+  9f2c1ab4   the first task · 12 msgs · 10-12 14:05
+  3d1e77aa   3 msgs · 10-12 13:58
+
+resume with: hal --session <id>
+```
+
 ### Web console
 
 `--web` serves the same console in a browser instead of the terminal: the same
@@ -217,13 +247,33 @@ Restoring the transcript reads the session's messages; tool output comes back
 whole, while per-call durations are not part of the session file and are lost
 across a restart.
 
+### Transient provider failures
+
+Gateways drop connections: a reset (`read: connection reset by peer`), a timeout,
+or a `429`/`5xx` response. hal treats those as transient and retries the request
+with exponential backoff (0.5s, 1s, 2s, 4s, capped at 10s), four times by
+default. A `Retry-After` header from the server wins over the backoff. The TUI,
+the web console, and print mode report each retry as it happens:
+
+```
+retrying  request to https://… failed: … connection reset by peer
+          — attempt 1 of 4 in 0.5s
+```
+
+Retrying stops at the first failure that is not transient (a `400`, a bad
+response body), and it never retries once part of the answer has been streamed —
+that text has already been shown, and a retry would duplicate it. An abort
+(`esc`) cancels a backoff wait immediately. The budget is `--max-retries` (or
+`max_retries` in the config file); a negative value disables retrying, and `0`
+means the default.
+
 ### Editor and keys
 
 | Key | Action |
 |---|---|
 | `enter` | submit (queues the message if the agent is working) |
 | `alt+enter` | newline |
-| `esc` | abort the current run |
+| `esc` | abort the current run, or close the session switcher |
 | `pgup`/`pgdn`, `alt+up`/`alt+down` | scroll the transcript |
 | `ctrl+l` | clear the transcript |
 | `ctrl+c` | quit |
@@ -232,7 +282,8 @@ across a restart.
 
 ```
 /help      /model [name]   /new      /session
-/tools     /clear          /quit
+/switch [id]              /sessions /tools
+/clear     /quit
 ```
 
 ### Context files

@@ -91,6 +91,9 @@ type File struct {
 	Tools string `toml:"tools" json:"tools"`
 	// MaxTurns caps agent turns per prompt (0 = built-in default).
 	MaxTurns int `toml:"max_turns" json:"max_turns"`
+	// MaxRetries is how many times a transient provider failure is retried
+	// (0 = built-in default, negative disables retrying).
+	MaxRetries int `toml:"max_retries" json:"max_retries"`
 	// SystemPrompt replaces the default system prompt; a value that names an
 	// existing file is read from disk.
 	SystemPrompt string `toml:"system_prompt" json:"system_prompt"`

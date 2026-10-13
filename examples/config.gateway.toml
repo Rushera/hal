@@ -28,6 +28,9 @@ session_header = "x-session-id"
 tools     = "read,bash,edit,write,grep,find,ls"
 max_turns = 90
 
+# Flaky gateways reset connections; retry a few more times than the default.
+max_retries = 6
+
 append_system_prompt = ""
 
 session_dir = ""

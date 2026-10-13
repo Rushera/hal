@@ -8,6 +8,30 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **Session switching.** `/switch` in the TUI opens a picker of the sessions
+  stored for the directory (`↑`/`↓`, `enter`, `esc`), `/switch <id>` opens one
+  directly, and `/sessions` lists them; switching aborts a turn in flight and
+  replays the conversation it switched to. The web console gets a session menu in
+  the header and the same `/switch` / `/sessions` commands. `hal
+  --list-sessions` prints the stored conversations with the ids `--session`
+  accepts, and `hal --continue-all` resumes the most recent session for the
+  machine rather than only for the working directory.
+- **Retries for transient provider failures.** A reset connection
+  (`read: connection reset by peer`), a timeout, a `429`, or a `5xx` is now
+  retried with exponential backoff (0.5s to 10s, four attempts by default)
+  instead of failing the turn. A server `Retry-After` wins over the backoff, an
+  abort during a backoff stops immediately, and a failure after part of the
+  answer was streamed is not retried (that text has already been shown). Every
+  retry is reported in the TUI, the web console, and print mode. The budget is
+  `--max-retries` / `max_retries`.
+- The provider HTTP client now bounds only the wait for response headers, so a
+  long streamed answer is never cut off, and it reuses connections per host.
+
+### Fixed
+
+- A dropped connection in the middle of a stream is no longer presented as an
+  empty answer: an unfinished stream that delivered nothing is treated as a
+  transient failure and retried.
 - The web console reuses its access token from
   `$XDG_STATE_HOME/hal/web-token` (overridable with `--web-token` or
   `$HAL_WEB_TOKEN`), so a restarted process keeps serving a page that is already

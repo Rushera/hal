@@ -39,11 +39,11 @@ func SearchRoots(explicit string) []string {
 }
 
 // LatestIn returns the most recent session across the given roots.
-func LatestIn(roots []string, cwd string) (string, error) {
+func LatestIn(roots []string, cwd string, all bool) (string, error) {
 	var newest string
 	var newestTime time.Time
 	for _, root := range roots {
-		infos, err := List(root, cwd)
+		infos, err := List(root, cwd, all)
 		if err != nil || len(infos) == 0 {
 			continue
 		}
@@ -330,7 +330,7 @@ func FindByID(root, id string) (string, error) {
 
 // Latest returns the most recently modified session for a working directory.
 func Latest(root, cwd string) (string, error) {
-	infos, err := List(root, cwd)
+	infos, err := List(root, cwd, false)
 	if err != nil {
 		return "", err
 	}
@@ -340,9 +340,47 @@ func Latest(root, cwd string) (string, error) {
 	return infos[0].Path, nil
 }
 
-// List returns sessions for a working directory, newest first.
-func List(root, cwd string) ([]Info, error) {
-	dir := ProjectDir(root, cwd)
+// List returns sessions, newest first. It covers the working directory's own
+// bucket, or every bucket under root when all is set, which is what the session
+// switchers use to show the conversations stored for this machine.
+func List(root, cwd string, all bool) ([]Info, error) {
+	if all {
+		return listAll(root, cwd)
+	}
+	return listDir(ProjectDir(root, cwd))
+}
+
+// listAll walks every project bucket under root and keeps the sessions whose
+// recorded cwd is wanted (when wanted is not empty).
+func listAll(root, wanted string) ([]Info, error) {
+	if strings.TrimSpace(wanted) != "" {
+		if abs, err := filepath.Abs(wanted); err == nil {
+			wanted = abs
+		}
+	}
+	var infos []Info
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() || !strings.HasSuffix(d.Name(), ".jsonl") {
+			return nil
+		}
+		info, serr := stat(path)
+		if serr != nil {
+			return nil
+		}
+		if wanted != "" && info.Cwd != wanted {
+			return nil
+		}
+		infos = append(infos, info)
+		return nil
+	})
+	sortInfos(infos)
+	return infos, nil
+}
+
+func listDir(dir string) ([]Info, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -362,14 +400,19 @@ func List(root, cwd string) ([]Info, error) {
 		}
 		infos = append(infos, info)
 	}
+	sortInfos(infos)
+	return infos, nil
+}
+
+// sortInfos orders sessions newest first, with a deterministic tie-break when
+// two timestamps collide.
+func sortInfos(infos []Info) {
 	sort.Slice(infos, func(i, j int) bool {
 		if !infos[i].UpdatedAt.Equal(infos[j].UpdatedAt) {
 			return infos[i].UpdatedAt.After(infos[j].UpdatedAt)
 		}
-		// deterministic tie-break when timestamps collide
 		return infos[i].Path > infos[j].Path
 	})
-	return infos, nil
 }
 
 func stat(path string) (Info, error) {

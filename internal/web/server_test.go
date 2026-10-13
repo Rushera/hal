@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/Rushera/hal/internal/agent"
+	"github.com/Rushera/hal/internal/session"
 )
 
 // fakeAgent is a scripted stand-in for *agent.Agent.
@@ -653,11 +654,11 @@ func TestOpenSessionCallbackRestoresTheNamedSession(t *testing.T) {
 	var opened string
 	srv := newTestServer(t, ag, func(o *Options) {
 		o.SessionID = func() string { return id }
-		o.OpenSession = func(want string) error {
+		o.OpenSession = func(want string) (string, error) {
 			opened = want
 			ag.setHistory(agent.NewUserMessage("from " + want))
 			id = want
-			return nil
+			return want, nil
 		}
 	})
 	ts := httptest.NewServer(srv.Handler())
@@ -690,9 +691,9 @@ func TestUnknownSessionInTheURLLeavesTheConsoleUsable(t *testing.T) {
 	var attempts int
 	srv := newTestServer(t, &fakeAgent{}, func(o *Options) {
 		o.SessionID = func() string { return "aaaa000011112222" }
-		o.OpenSession = func(string) error {
+		o.OpenSession = func(string) (string, error) {
 			attempts++
-			return errors.New("no such session")
+			return "", errors.New("no such session")
 		}
 	})
 	ts := httptest.NewServer(srv.Handler())
@@ -711,5 +712,248 @@ func TestUnknownSessionInTheURLLeavesTheConsoleUsable(t *testing.T) {
 	}
 	if got := srv.SessionID(); got != "aaaa000011112222" {
 		t.Fatalf("session changed to %q after a failed open", got)
+	}
+}
+
+func TestSessionMenuIsSentWithTheSnapshot(t *testing.T) {
+	now := time.Now()
+	fake := &fakeAgent{}
+	srv := newTestServer(t, fake, func(o *Options) {
+		o.SessionID = func() string { return "aaaa000011112222" }
+		o.ListSessions = func() []session.Info {
+			return []session.Info{
+				{ID: "bbbb111122223333", Name: "older task", Model: "gpt-x", Messages: 4, UpdatedAt: now},
+				{ID: "aaaa000011112222", Name: "current", Model: "gpt-x", Messages: 2, UpdatedAt: now},
+			}
+		}
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	stream := connectSSE(t, ts.URL, srv.Token())
+	defer stream.close()
+	state := stream.waitFor(t, "state")
+	if len(state.Sessions) != 2 {
+		t.Fatalf("sessions in the snapshot = %+v, want 2", state.Sessions)
+	}
+	if state.Sessions[0].ID != "bbbb111122223333" || state.Sessions[0].Name != "older task" ||
+		state.Sessions[0].Messages != 4 || state.Sessions[0].UpdatedAt == "" {
+		t.Fatalf("first session entry = %+v", state.Sessions[0])
+	}
+	if !state.Sessions[1].Current {
+		t.Fatalf("the current session must be flagged: %+v", state.Sessions[1])
+	}
+	if state.Sessions[0].Current {
+		t.Fatalf("only the current session may be flagged: %+v", state.Sessions[0])
+	}
+}
+
+func TestOpenSessionEndpointSwitchesAndBroadcasts(t *testing.T) {
+	ag := &fakeAgent{}
+	id := "aaaa000011112222"
+	srv := newTestServer(t, ag, func(o *Options) {
+		o.SessionID = func() string { return id }
+		o.OpenSession = func(want string) (string, error) {
+			ag.setHistory(agent.NewUserMessage("from " + want))
+			id = want
+			return "(" + want + ")", nil
+		}
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	stream := connectSSE(t, ts.URL, srv.Token())
+	defer stream.close()
+	stream.waitFor(t, "state")
+
+	resp := post(t, ts.URL, srv.Token(), "/api/session/open", `{"id":"cccc666677778888"}`)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("open status = %d", resp.StatusCode)
+	}
+	if got := srv.SessionID(); got != "cccc666677778888" {
+		t.Fatalf("server session = %q", got)
+	}
+
+	// The pages see the switch as a new snapshot, already holding the
+	// conversation that was opened.
+	state := stream.waitFor(t, "state")
+	if state.SessionID != "cccc666677778888" {
+		t.Fatalf("broadcast sessionId = %q", state.SessionID)
+	}
+	if len(state.Blocks) == 0 || state.Blocks[0].Body != "from cccc666677778888" {
+		t.Fatalf("transcript not rebuilt for the opened session: %+v", state.Blocks)
+	}
+	var noted bool
+	for _, b := range state.Blocks {
+		if b.Body == "switched to session (cccc666677778888)" {
+			noted = true
+		}
+	}
+	if !noted {
+		t.Fatalf("the switch should be noted in the transcript: %+v", state.Blocks)
+	}
+}
+
+func TestOpenSessionEndpointReportsFailure(t *testing.T) {
+	id := "aaaa000011112222"
+	srv := newTestServer(t, &fakeAgent{}, func(o *Options) {
+		o.SessionID = func() string { return id }
+		o.OpenSession = func(string) (string, error) { return "", errors.New("no such session") }
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp := post(t, ts.URL, srv.Token(), "/api/session/open", `{"id":"missing"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("open status = %d, want 409", resp.StatusCode)
+	}
+	if got := srv.SessionID(); got != id {
+		t.Fatalf("session changed to %q after a failed open", got)
+	}
+}
+
+func TestSessionEndpointsRequireToken(t *testing.T) {
+	srv := newTestServer(t, &fakeAgent{}, func(o *Options) {
+		o.SessionID = func() string { return "aaaa000011112222" }
+		o.OpenSession = func(string) (string, error) { return "", nil }
+		o.ListSessions = func() []session.Info { return nil }
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	for _, path := range []string{"/api/sessions", "/api/session/open"} {
+		req, err := http.NewRequest(http.MethodPost, ts.URL+path, strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("%s without a token = %d, want 403", path, resp.StatusCode)
+		}
+	}
+}
+
+func TestSessionsEndpointListsWithoutTheCurrentOneFlagged(t *testing.T) {
+	srv := newTestServer(t, &fakeAgent{}, func(o *Options) {
+		o.SessionID = func() string { return "aaaa000011112222" }
+		o.ListSessions = func() []session.Info {
+			return []session.Info{{ID: "aaaa000011112222", Messages: 1}}
+		}
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp := post(t, ts.URL, srv.Token(), "/api/sessions", `{}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("sessions status = %d", resp.StatusCode)
+	}
+	var body struct {
+		Sessions []sessionInfo `json:"sessions"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Sessions) != 1 || !body.Sessions[0].Current {
+		t.Fatalf("sessions = %+v", body.Sessions)
+	}
+}
+
+func TestOpenSessionWithNoOpenerIsRejected(t *testing.T) {
+	id := "aaaa000011112222"
+	srv := newTestServer(t, &fakeAgent{}, func(o *Options) {
+		o.SessionID = func() string { return id }
+	})
+	if err := srv.OpenSession("bbbb111122223333"); err == nil {
+		t.Fatal("expected an error when sessions are disabled")
+	}
+	if err := srv.OpenSession(id); err != nil {
+		t.Fatalf("opening the current session should be a no-op: %v", err)
+	}
+}
+
+func TestRetryIsReportedToThePage(t *testing.T) {
+	fake := &fakeAgent{script: []agent.Event{
+		{Type: agent.EventRetry, Error: "read: connection reset by peer",
+			Attempt: 1, MaxAttempts: 4, RetryInMS: 500},
+		{Type: agent.EventTextDelta, Text: "recovered"},
+		{Type: agent.EventDone},
+	}}
+	srv := newTestServer(t, fake)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	stream := connectSSE(t, ts.URL, srv.Token())
+	defer stream.close()
+	stream.waitFor(t, "state")
+
+	resp := post(t, ts.URL, srv.Token(), "/api/prompt", `{"text":"go"}`)
+	resp.Body.Close()
+
+	ev := stream.waitFor(t, "system")
+	if ev.Title != "retrying" {
+		t.Fatalf("expected a retrying notice, got %+v", ev)
+	}
+	if !strings.Contains(ev.Text, "connection reset") || !strings.Contains(ev.Text, "attempt 1 of 4") {
+		t.Fatalf("retry notice = %q", ev.Text)
+	}
+	var found bool
+	for _, b := range srv.snapshotEvent().Blocks {
+		if b.Kind == kindSystem && b.Title == "retrying" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the retry should be in the transcript: %+v", srv.snapshotEvent().Blocks)
+	}
+}
+
+func TestSwitchingWhileRunningIsNotReportedAsAFailure(t *testing.T) {
+	id := "aaaa000011112222"
+	fake := &fakeAgent{blocking: true}
+	srv := newTestServer(t, fake, func(o *Options) {
+		o.SessionID = func() string { return id }
+		o.OpenSession = func(want string) (string, error) {
+			id = want
+			return "(" + want + ")", nil
+		}
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	stream := connectSSE(t, ts.URL, srv.Token())
+	defer stream.close()
+	stream.waitFor(t, "state")
+
+	resp := post(t, ts.URL, srv.Token(), "/api/prompt", `{"text":"long task"}`)
+	resp.Body.Close()
+	// Wait until the turn is actually running, then switch out from under it.
+	deadline := time.Now().Add(2 * time.Second)
+	for !srv.isRunning() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	resp = post(t, ts.URL, srv.Token(), "/api/session/open", `{"id":"bbbb111122223333"}`)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("switch status = %d", resp.StatusCode)
+	}
+	if err := srv.OpenSession("cccc222233334444"); err != nil {
+		t.Fatalf("second switch: %v", err)
+	}
+
+	state := stream.waitFor(t, "state")
+	for _, b := range state.Blocks {
+		if b.Kind == kindError && strings.Contains(b.Body, "context canceled") {
+			t.Fatalf("the switch's abort must not be reported as a failure: %+v", state.Blocks)
+		}
+	}
+	if srv.isRunning() {
+		t.Fatal("the aborted turn should have finished")
 	}
 }

@@ -42,6 +42,11 @@ tools = "read,bash,edit,write,grep,find,ls"
 # Maximum model round trips per prompt before the run is stopped.
 max_turns = 32
 
+# Retries for a transient provider failure (a reset connection, a timeout, a
+# 429 or 5xx response), with exponential backoff. 0 = built-in default (4),
+# negative = never retry.
+max_retries = 4
+
 # --- prompting --------------------------------------------------------------
 
 # Replaces the default system prompt entirely. Either literal text, or the path to

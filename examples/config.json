@@ -6,6 +6,7 @@
   "api_key_env": "",
   "tools": "read,bash,edit,write,grep,find,ls",
   "max_turns": 32,
+  "max_retries": 4,
   "system_prompt": "",
   "append_system_prompt": "Prefer small, focused changes and run the tests before finishing.",
   "session_dir": "",

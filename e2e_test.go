@@ -11,7 +11,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Rushera/hal/internal/agent"
 	"github.com/Rushera/hal/internal/provider"
@@ -570,5 +572,111 @@ func TestSessionPersistenceThroughAgent(t *testing.T) {
 	}
 	if !strings.Contains(lines[0], `"type":"session"`) || !strings.Contains(lines[1], `"role":"user"`) {
 		t.Fatalf("unexpected session file:\n%s", data)
+	}
+}
+
+// resetServer accepts connections and immediately drops them, which is what the
+// "read: connection reset by peer" failure looks like from the client side.
+type resetServer struct {
+	*httptest.Server
+	hits int32
+}
+
+func newResetServer(t *testing.T, resets int) *resetServer {
+	t.Helper()
+	rs := &resetServer{}
+	rs.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if int(atomic.AddInt32(&rs.hits, 1)) <= resets {
+			// Close the connection under the client without a response.
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				http.Error(w, "no hijack", http.StatusInternalServerError)
+				return
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, c := range textChunks("recovered at last") {
+			fmt.Fprintf(w, "data: %s\n\n", c)
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	t.Cleanup(rs.Close)
+	return rs
+}
+
+// TestAgentSurvivesResetConnections is the end-to-end version of the reported
+// bug: a gateway that resets the first connections must not fail the turn.
+func TestAgentSurvivesResetConnections(t *testing.T) {
+	workdir := t.TempDir()
+	rs := newResetServer(t, 2)
+	prov := provider.NewFromEnv("k", rs.URL, "mock")
+	toolSet, _ := tools.Select(workdir, "")
+	ag := agent.New(prov, toolSet, workdir, "")
+	ag.RetryBaseDelay = time.Millisecond // keep the test fast
+	var sleeps []time.Duration
+	ag.Sleep = func(ctx context.Context, d time.Duration) error { sleeps = append(sleeps, d); return nil }
+
+	var text strings.Builder
+	var retries int
+	err := ag.RunPrompt(context.Background(), "hello", func(ev agent.Event) {
+		switch ev.Type {
+		case agent.EventTextDelta:
+			text.WriteString(ev.Text)
+		case agent.EventRetry:
+			retries++
+		case agent.EventError:
+			t.Fatalf("the turn must not fail: %s", ev.Error)
+		}
+	})
+	if err != nil {
+		t.Fatalf("the turn should have recovered: %v", err)
+	}
+	if text.String() != "recovered at last" {
+		t.Fatalf("answer = %q", text.String())
+	}
+	if retries != 2 {
+		t.Fatalf("retry events = %d, want 2", retries)
+	}
+	if len(sleeps) != 2 {
+		t.Fatalf("backoff sleeps = %v", sleeps)
+	}
+	if got := atomic.LoadInt32(&rs.hits); got != 3 {
+		t.Fatalf("server hits = %d, want 3", got)
+	}
+	// The aborted attempts must not have polluted the conversation.
+	msgs := ag.Messages()
+	if len(msgs) != 2 || msgs[0].Role != agent.RoleUser || msgs[1].Content != "recovered at last" {
+		t.Fatalf("history = %+v", msgs)
+	}
+}
+
+// TestAgentReportsPersistentResetConnections checks the failure surfaces with
+// the transport detail once the retries are exhausted.
+func TestAgentReportsPersistentResetConnections(t *testing.T) {
+	workdir := t.TempDir()
+	rs := newResetServer(t, 99)
+	prov := provider.NewFromEnv("k", rs.URL, "mock")
+	toolSet, _ := tools.Select(workdir, "")
+	ag := agent.New(prov, toolSet, workdir, "")
+	ag.MaxRetries = 2
+	ag.RetryBaseDelay = time.Millisecond
+	ag.Sleep = func(ctx context.Context, d time.Duration) error { return nil }
+
+	err := ag.RunPrompt(context.Background(), "hello", func(agent.Event) {})
+	if err == nil {
+		t.Fatal("expected the run to fail when every attempt resets")
+	}
+	// The user should see why, not just "EOF".
+	if !strings.Contains(err.Error(), "reset") && !strings.Contains(err.Error(), "EOF") {
+		t.Fatalf("the transport failure should be reported: %v", err)
+	}
+	if got := atomic.LoadInt32(&rs.hits); got != 3 { // 1 try + 2 retries
+		t.Fatalf("server hits = %d, want 3", got)
 	}
 }

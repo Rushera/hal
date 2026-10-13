@@ -9,10 +9,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,6 +27,22 @@ const DefaultBaseURL = "https://api.openai.com/v1"
 
 // DefaultModel is used when no model is configured.
 const DefaultModel = "gpt-4o-mini"
+
+// Transient failures: the agent retries these with backoff.
+const (
+	// HeaderTimeout bounds the wait for the response headers (and for a
+	// connection). It deliberately does not cover the streamed body: a long
+	// answer must not be cut off, only a server that never answers.
+	HeaderTimeout = 60 * time.Second
+	// maxErrorBody caps how much of a failed response is read for the message.
+	maxErrorBody = 8192
+	// maxIdleConnsPerHost keeps a gateway's connections warm, which matters for
+	// the retries above: a fresh connection to a flaky endpoint may reset again.
+	maxIdleConnsPerHost = 8
+)
+
+// retryAfterHeader is the standard header naming how long to wait.
+const retryAfterHeader = "Retry-After"
 
 // OpenAI is an OpenAI-compatible chat completions client.
 type OpenAI struct {
@@ -67,7 +86,26 @@ func NewFromEnv(apiKey, baseURL, model string) *OpenAI {
 		APIKey:     apiKey,
 		BaseURL:    strings.TrimRight(baseURL, "/"),
 		Model:      model,
-		HTTPClient: &http.Client{Timeout: 0}, // streaming: no overall timeout
+		HTTPClient: newHTTPClient(HeaderTimeout),
+	}
+}
+
+// newHTTPClient builds the client used for streaming requests. The timeout only
+// bounds the wait for response headers, and the transport is tuned for the
+// connection resets common to flaky gateways.
+func newHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   maxIdleConnsPerHost,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   15 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
 	}
 }
 
@@ -212,16 +250,121 @@ func (o *OpenAI) Stream(ctx context.Context, messages []agent.Message, tools []a
 
 	resp, err := o.client().Do(httpReq)
 	if err != nil {
-		return agent.Message{}, fmt.Errorf("request to %s failed: %w", url, err)
+		if ctx.Err() != nil {
+			// The user aborted; that is not a transport failure to retry.
+			return agent.Message{}, ctx.Err()
+		}
+		return agent.Message{}, classifyRequestError(url, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-		return agent.Message{}, fmt.Errorf("%s returned HTTP %d: %s", o.Name(), resp.StatusCode, strings.TrimSpace(string(raw)))
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
+		// Drain the rest so the connection can be reused for the retry.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		statusErr := fmt.Errorf("%s returned HTTP %d: %s", o.Name(), resp.StatusCode, strings.TrimSpace(string(raw)))
+		if isTransientStatus(resp.StatusCode) {
+			return agent.Message{}, &agent.RetryableError{
+				Err:        statusErr,
+				RetryAfter: retryAfter(resp.Header.Get(retryAfterHeader)),
+			}
+		}
+		return agent.Message{}, statusErr
 	}
 
-	return o.readStream(resp.Body, onText)
+	msg, err := o.readStream(resp.Body, onText)
+	if err != nil {
+		if ctx.Err() != nil {
+			return agent.Message{}, ctx.Err()
+		}
+		// A stream that dies half-way is the reset the user sees: it is worth
+		// retrying when no text has been delivered yet (the agent checks that).
+		if isTransientNetError(err) {
+			return agent.Message{}, &agent.RetryableError{Err: err}
+		}
+	}
+	return msg, err
+}
+
+// classifyRequestError wraps transport failures that are worth retrying. A
+// connection reset, a dropped connection and a timeout are all transient; a
+// malformed URL or a TLS failure is not.
+func classifyRequestError(url string, err error) error {
+	wrapped := fmt.Errorf("request to %s failed: %w", url, err)
+	if isTransientNetError(err) {
+		return &agent.RetryableError{Err: wrapped}
+	}
+	return wrapped
+}
+
+// isTransientNetError reports whether a transport-level failure is worth
+// retrying: connection resets, dropped connections, broken pipes and timeouts.
+func isTransientNetError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return true // timeouts and other temporary network errors
+	}
+	var oe *net.OpError
+	if errors.As(err, &oe) {
+		return true
+	}
+	// The reset that motivated this shows up as a plain error string from the
+	// TLS/HTTP stack ("read: connection reset by peer"), so match on text too.
+	msg := strings.ToLower(err.Error())
+	for _, needle := range []string{
+		"connection reset",
+		"connection refused",
+		"broken pipe",
+		"unexpected eof",
+		"eof",
+		"reset by peer",
+		"server closed idle connection",
+		"http2: server sent goaway",
+		"stream error",
+		"i/o timeout",
+		"temporarily unavailable",
+	} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// isTransientStatus reports whether an HTTP status is worth retrying: rate
+// limits and server-side failures.
+func isTransientStatus(code int) bool {
+	switch code {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return true
+	}
+	return code >= 500 && code <= 599
+}
+
+// retryAfter parses the Retry-After header, in seconds or as an HTTP date.
+func retryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 func (o *OpenAI) readStream(r io.Reader, onText func(string)) (agent.Message, error) {
@@ -236,6 +379,7 @@ func (o *OpenAI) readStream(r io.Reader, onText func(string)) (agent.Message, er
 		toolAccs = map[int]*acc{}
 		order    []int
 		usage    *agent.Usage
+		sawDone  bool
 	)
 
 	scanner := bufio.NewScanner(r)
@@ -247,6 +391,7 @@ func (o *OpenAI) readStream(r io.Reader, onText func(string)) (agent.Message, er
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "[DONE]" {
+			sawDone = true
 			break
 		}
 		var chunk streamChunk
@@ -291,6 +436,14 @@ func (o *OpenAI) readStream(r io.Reader, onText func(string)) (agent.Message, er
 	}
 	if err := scanner.Err(); err != nil {
 		return agent.Message{}, fmt.Errorf("stream read error: %w", err)
+	}
+	if !sawDone && text.Len() == 0 && len(order) == 0 {
+		// The server ended the response without a single chunk and without the
+		// [DONE] marker: a reset right after the headers, which is worth
+		// retrying rather than presenting as an empty answer.
+		return agent.Message{}, &agent.RetryableError{
+			Err: fmt.Errorf("the stream ended before the model sent anything"),
+		}
 	}
 
 	out.Content = text.String()
