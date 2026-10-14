@@ -957,3 +957,108 @@ func TestSwitchingWhileRunningIsNotReportedAsAFailure(t *testing.T) {
 		t.Fatal("the aborted turn should have finished")
 	}
 }
+
+// TestSwitchDuringARunDoesNotLeakTheOldTurn is the race the switcher has to
+// survive: a turn is streaming when the console switches to another session, and
+// the events of the abandoned run must not land in the conversation that was
+// opened.
+func TestSwitchDuringARunDoesNotLeakTheOldTurn(t *testing.T) {
+	ag := &fakeAgent{blocking: true}
+	id := "aaaa000011112222"
+	srv := newTestServer(t, ag, func(o *Options) {
+		o.SessionID = func() string { return id }
+		o.OpenSession = func(want string) (string, error) {
+			ag.setHistory(agent.NewUserMessage("stored in " + want))
+			id = want
+			return "(" + want + ")", nil
+		}
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	stream := connectSSE(t, ts.URL, srv.Token())
+	defer stream.close()
+	stream.waitFor(t, "state")
+
+	// Start a turn that blocks until it is aborted, and let it reach the point
+	// where it is streaming.
+	resp := post(t, ts.URL, srv.Token(), "/api/prompt", `{"text":"slow work"}`)
+	resp.Body.Close()
+	stream.waitFor(t, "user")
+	if !srv.isRunning() {
+		t.Fatal("the run should be in flight")
+	}
+
+	// Switch while it runs; the server must abort the turn and wait it out.
+	openResp := post(t, ts.URL, srv.Token(), "/api/session/open", `{"id":"bbbb111122223333"}`)
+	openResp.Body.Close()
+	if openResp.StatusCode != http.StatusOK {
+		t.Fatalf("open status = %d", openResp.StatusCode)
+	}
+	if !ag.wasAborted() {
+		t.Fatal("switching must abort the running turn")
+	}
+	if srv.isRunning() {
+		t.Fatal("the switch must wait for the aborted run to finish")
+	}
+	if got := srv.SessionID(); got != "bbbb111122223333" {
+		t.Fatalf("session = %q", got)
+	}
+
+	// The transcript must be the opened session, not the abandoned turn.
+	state := srv.snapshotEvent()
+	for _, b := range state.Blocks {
+		if b.Body == "slow work" {
+			t.Fatalf("the abandoned turn leaked into the opened session: %+v", state.Blocks)
+		}
+	}
+	if len(state.Blocks) == 0 || state.Blocks[0].Body != "stored in bbbb111122223333" {
+		t.Fatalf("transcript not rebuilt for the opened session: %+v", state.Blocks)
+	}
+}
+
+// TestSwitchDropsTheQueueOfTheAbandonedTurn checks the queued prompts of the old
+// conversation do not run against the new one.
+func TestSwitchDropsTheQueueOfTheAbandonedTurn(t *testing.T) {
+	ag := &fakeAgent{blocking: true}
+	id := "aaaa000011112222"
+	srv := newTestServer(t, ag, func(o *Options) {
+		o.SessionID = func() string { return id }
+		o.OpenSession = func(want string) (string, error) {
+			id = want
+			return "", nil
+		}
+	})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	stream := connectSSE(t, ts.URL, srv.Token())
+	defer stream.close()
+	stream.waitFor(t, "state")
+
+	resp := post(t, ts.URL, srv.Token(), "/api/prompt", `{"text":"first"}`)
+	resp.Body.Close()
+	stream.waitFor(t, "user")
+
+	// Queue a second prompt, then switch away.
+	resp = post(t, ts.URL, srv.Token(), "/api/prompt", `{"text":"queued for the old session"}`)
+	resp.Body.Close()
+	stream.waitFor(t, "system") // the "queued" notice
+
+	openResp := post(t, ts.URL, srv.Token(), "/api/session/open", `{"id":"bbbb111122223333"}`)
+	openResp.Body.Close()
+
+	// Give the (now empty) queue a moment; the abandoned prompt must not run.
+	time.Sleep(50 * time.Millisecond)
+	ag.mu.Lock()
+	prompts := append([]string(nil), ag.prompts...)
+	ag.mu.Unlock()
+	for _, p := range prompts {
+		if p == "queued for the old session" {
+			t.Fatalf("a queued prompt of the abandoned turn ran: %v", prompts)
+		}
+	}
+	if srv.isRunning() {
+		t.Fatal("no turn should be running after the switch")
+	}
+}

@@ -221,3 +221,116 @@ func TestCompleteStreamIsNotAnError(t *testing.T) {
 		t.Fatalf("content = %q", msg.Content)
 	}
 }
+
+func TestStalledServerTimesOutOnHeaders(t *testing.T) {
+	// A server that accepts the request and never answers: the header deadline
+	// must end the wait, and the failure must be retryable.
+	release := make(chan struct{})
+	defer close(release)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-time.After(2 * time.Second):
+		}
+	}))
+	defer srv.Close()
+
+	o := NewFromEnv("k", srv.URL, "m").WithHeaderTimeout(50 * time.Millisecond)
+	start := time.Now()
+	_, err := o.Stream(context.Background(), []agent.Message{agent.NewUserMessage("hi")}, nil, nil)
+	if err == nil {
+		t.Fatal("expected a timeout")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("the header deadline was not honored: %v", elapsed)
+	}
+	if !transient(err) {
+		t.Fatalf("a stalled server should be retried: %v", err)
+	}
+}
+
+func TestSlowStreamIsNotCutOffByTheHeaderTimeout(t *testing.T) {
+	// The header deadline must not bound the body: a server that answers at once
+	// and then streams slowly must complete.
+	const chunks = 4
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		flusher.Flush() // headers are out; the body takes its time
+		for i := 0; i < chunks; i++ {
+			time.Sleep(60 * time.Millisecond)
+			fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":\"c%d\"}}]}\n\n", i)
+			flusher.Flush()
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer srv.Close()
+
+	o := NewFromEnv("k", srv.URL, "m").WithHeaderTimeout(20 * time.Millisecond)
+	msg, err := o.Stream(context.Background(), []agent.Message{agent.NewUserMessage("hi")}, nil, nil)
+	if err != nil {
+		t.Fatalf("a slow stream must not be cut off: %v", err)
+	}
+	if msg.Content != "c0c1c2c3" {
+		t.Fatalf("content = %q, want the whole stream", msg.Content)
+	}
+}
+
+func TestResetThenFullAnswerThroughTheAgentLoop(t *testing.T) {
+	// The reported failure, end to end at the provider boundary: the first
+	// connection is reset, the retry gets a complete streamed answer.
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&hits, 1) == 1 {
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				http.Error(w, "no hijack", http.StatusInternalServerError)
+				return
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"all good\"}}]}\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	o := NewFromEnv("k", srv.URL, "m")
+	_, err := o.Stream(context.Background(), []agent.Message{agent.NewUserMessage("hi")}, nil, nil)
+	if !transient(err) {
+		t.Fatalf("the reset should be classified as retryable: %v", err)
+	}
+
+	msg, err := o.Stream(context.Background(), []agent.Message{agent.NewUserMessage("hi")}, nil, nil)
+	if err != nil {
+		t.Fatalf("the retry should succeed: %v", err)
+	}
+	if msg.Content != "all good" {
+		t.Fatalf("content = %q", msg.Content)
+	}
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Fatalf("server hits = %d, want 2", got)
+	}
+}
+
+func TestClassifyRequestErrorMarksResets(t *testing.T) {
+	reset := &net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset by peer")}
+	err := classifyRequestError("https://x/v1/chat/completions", reset)
+	if !transient(err) {
+		t.Fatalf("a reset must be retryable: %v", err)
+	}
+	if !strings.Contains(err.Error(), "https://x/v1/chat/completions") {
+		t.Fatalf("the message should name the endpoint: %v", err)
+	}
+	permanent := classifyRequestError("https://x/v1", errors.New("unsupported protocol scheme"))
+	if transient(permanent) {
+		t.Fatalf("a permanent failure must not be retryable: %v", permanent)
+	}
+}

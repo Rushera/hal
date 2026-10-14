@@ -24,14 +24,18 @@ All notable changes to this project are documented here. The format follows
   answer was streamed is not retried (that text has already been shown). Every
   retry is reported in the TUI, the web console, and print mode. The budget is
   `--max-retries` / `max_retries`.
-- The provider HTTP client now bounds only the wait for response headers, so a
-  long streamed answer is never cut off, and it reuses connections per host.
+- The provider HTTP client reuses connections per host and bounds only the wait
+  for response headers.
 
 ### Fixed
 
 - A dropped connection in the middle of a stream is no longer presented as an
   empty answer: an unfinished stream that delivered nothing is treated as a
   transient failure and retried.
+- A long streamed answer is no longer cut off: only the wait for response headers
+  is bounded, which a whole-request timeout would have covered too.
+- The TUI session picker fits the terminal: entries are clipped and the list is
+  windowed to the height, so a narrow or short terminal no longer overflows.
 - The web console reuses its access token from
   `$XDG_STATE_HOME/hal/web-token` (overridable with `--web-token` or
   `$HAL_WEB_TOKEN`), so a restarted process keeps serving a page that is already

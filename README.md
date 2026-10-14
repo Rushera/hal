@@ -175,10 +175,11 @@ between them without restarting:
 
 - **In the TUI**, `/switch` opens a picker of the sessions stored for the
   directory (newest first, with the current one flagged); `↑`/`↓` choose, `enter`
-  opens, `esc` cancels. `/switch <id>` opens one directly, and `/sessions` lists
-  them. Switching aborts a turn that is in flight and replays the conversation
-  it switched to (tool output is not part of the history, so those blocks come
-  back as calls without their results).
+  opens, `esc` cancels, and a digit jumps to that entry. The list is windowed to
+  the terminal height, so it fits at any size. `/switch <id>` opens one directly,
+  and `/sessions` lists them. Switching aborts a turn that is in flight and
+  replays the conversation it switched to (tool output is not part of the
+  history, so those blocks come back as calls without their results).
 - **In the web console**, the menu in the header lists the same sessions; the
   footer keeps showing the current one. `/switch <id>` and `/sessions` work
   there too. Because the session id is in the URL, reloading a tab reopens the
@@ -263,9 +264,10 @@ retrying  request to https://… failed: … connection reset by peer
 Retrying stops at the first failure that is not transient (a `400`, a bad
 response body), and it never retries once part of the answer has been streamed —
 that text has already been shown, and a retry would duplicate it. An abort
-(`esc`) cancels a backoff wait immediately. The budget is `--max-retries` (or
-`max_retries` in the config file); a negative value disables retrying, and `0`
-means the default.
+(`esc`) cancels a backoff wait immediately. Only the wait for response headers is
+bounded (60s), so a slow but healthy stream is never cut off. The budget is
+`--max-retries` (or `max_retries` in the config file); a negative value disables
+retrying, and `0` means the default.
 
 ### Editor and keys
 

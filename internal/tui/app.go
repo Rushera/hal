@@ -697,14 +697,53 @@ func summarizeArgs(raw string) string {
 	return truncate(strings.ReplaceAll(raw, "\n", " "), 60)
 }
 
+// pickerWindow is how many sessions fit in the picker, given the terminal
+// height. A picker that does not fit would push the footer off the screen.
+func (m *Model) pickerWindow() int {
+	// Header (1) + picker border (2) + heading (1) + summary (1) + footer (1).
+	room := m.height - 6
+	if room > pickerMax {
+		room = pickerMax
+	}
+	if room < 1 {
+		room = 1
+	}
+	return room
+}
+
+// pickerLines counts what viewPicker renders, for layout.
+func (m *Model) pickerLines() int {
+	start, end := m.pickerRange()
+	lines := 1 + (end - start) + 2 // heading + entries + border
+	if start > 0 || end < len(m.choices) {
+		lines++
+	}
+	return lines
+}
+
+// pickerRange is the slice of choices the window shows.
+func (m *Model) pickerRange() (start, end int) {
+	window := m.pickerWindow()
+	if m.selected >= window {
+		start = m.selected - window + 1
+	}
+	end = start + window
+	if end > len(m.choices) {
+		end = len(m.choices)
+	}
+	return start, end
+}
+
 func (m *Model) layout() {
 	editorHeight := m.ta.Height() + 2 // textarea + border
-	if m.picking {
-		editorHeight = m.pickerLines()
-	}
 	avail := m.height - editorHeight - 3
-	if avail < 3 {
-		avail = 3
+	if m.picking {
+		// While picking, the transcript steps aside: the picker needs the room
+		// and a short transcript viewport is a small price for a list that fits.
+		avail = 1
+	}
+	if avail < 1 {
+		avail = 1
 	}
 	if !m.ready || m.vp.Width == 0 {
 		m.vp = viewport.New(m.width, avail)
@@ -736,11 +775,13 @@ func (m *Model) View() string {
 	b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render(
 		"  " + shortenHome(m.opts.Cwd)))
 	b.WriteString("\n")
-	b.WriteString(m.vp.View())
-	b.WriteString("\n")
 	if m.picking {
+		// The picker replaces the transcript: it needs the vertical room, and
+		// a wrapped list would overflow the terminal.
 		b.WriteString(m.viewPicker())
 	} else {
+		b.WriteString(m.vp.View())
+		b.WriteString("\n")
 		b.WriteString(m.viewEditor())
 	}
 	b.WriteString("\n")
@@ -767,17 +808,27 @@ const pickerMax = 8
 
 // viewPicker renders the session switcher in place of the editor.
 func (m Model) viewPicker() string {
-	lines := []string{lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).
-		Render("switch session  (↑/↓ choose · enter open · esc cancel)")}
+	// The border and its padding take four columns; entries are clipped to what
+	// is left, otherwise a narrow terminal wraps them and the box overflows.
+	inner := m.width - 4
+	if inner < 10 {
+		inner = 10
+	}
+	clip := func(s string) string {
+		r := []rune(s)
+		if len(r) <= inner {
+			return s
+		}
+		if inner <= 1 {
+			return string(r[:inner])
+		}
+		return string(r[:inner-1]) + "…"
+	}
 
-	start := 0
-	if m.selected >= pickerMax {
-		start = m.selected - pickerMax + 1
-	}
-	end := start + pickerMax
-	if end > len(m.choices) {
-		end = len(m.choices)
-	}
+	lines := []string{lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).
+		Render(clip("switch session  (↑/↓ choose · enter open · esc cancel)"))}
+
+	start, end := m.pickerRange()
 	current := m.sessionID()
 	for i := start; i < end; i++ {
 		info := m.choices[i]
@@ -788,37 +839,20 @@ func (m Model) viewPicker() string {
 		if i == m.selected {
 			lines = append(lines, lipgloss.NewStyle().
 				Bold(true).Foreground(lipgloss.Color("39")).
-				Render("› "+text))
+				Render(clip("› "+text)))
 		} else {
-			lines = append(lines, "  "+text)
+			lines = append(lines, clip("  "+text))
 		}
 	}
 	if start > 0 || end < len(m.choices) {
 		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color("240")).
-			Render(fmt.Sprintf("  %d–%d of %d", start+1, end, len(m.choices))))
+			Render(clip(fmt.Sprintf("  %d–%d of %d", start+1, end, len(m.choices)))))
 	}
 	return lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("205")).
 		Width(m.width - 2).
 		Render(strings.Join(lines, "\n"))
-}
-
-// pickerLines counts what viewPicker renders, for layout.
-func (m *Model) pickerLines() int {
-	start := 0
-	if m.selected >= pickerMax {
-		start = m.selected - pickerMax + 1
-	}
-	end := start + pickerMax
-	if end > len(m.choices) {
-		end = len(m.choices)
-	}
-	lines := 1 + (end - start) + 2 // heading + entries + border
-	if start > 0 || end < len(m.choices) {
-		lines++
-	}
-	return lines
 }
 
 // sessionLabel describes a stored session in one line: its short id, why it is

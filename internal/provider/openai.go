@@ -90,12 +90,15 @@ func NewFromEnv(apiKey, baseURL, model string) *OpenAI {
 	}
 }
 
-// newHTTPClient builds the client used for streaming requests. The timeout only
-// bounds the wait for response headers, and the transport is tuned for the
-// connection resets common to flaky gateways.
-func newHTTPClient(timeout time.Duration) *http.Client {
+// newHTTPClient builds the client used for streaming requests. Only the wait for
+// response headers is bounded: a streamed body has no deadline, so a long answer
+// is never cut off. The transport is tuned for the connection resets common to
+// flaky gateways.
+func newHTTPClient(headerTimeout time.Duration) *http.Client {
 	return &http.Client{
-		Timeout: timeout,
+		// No client-level timeout: http.Client.Timeout also covers reading the
+		// body, which would truncate a long streamed answer.
+		Timeout: 0,
 		Transport: &http.Transport{
 			Proxy:                 http.ProxyFromEnvironment,
 			DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -105,6 +108,7 @@ func newHTTPClient(timeout time.Duration) *http.Client {
 			IdleConnTimeout:       90 * time.Second,
 			TLSHandshakeTimeout:   15 * time.Second,
 			ExpectContinueTimeout: 1 * time.Second,
+			ResponseHeaderTimeout: headerTimeout,
 		},
 	}
 }
@@ -514,9 +518,10 @@ func (o *OpenAI) Ping(ctx context.Context) error {
 	return nil
 }
 
-// WithTimeout returns a shallow copy using the given HTTP timeout.
-func (o *OpenAI) WithTimeout(d time.Duration) *OpenAI {
+// WithHeaderTimeout returns a shallow copy that gives up on a server which does
+// not answer with response headers within d. The streamed body is not bounded.
+func (o *OpenAI) WithHeaderTimeout(d time.Duration) *OpenAI {
 	cp := *o
-	cp.HTTPClient = &http.Client{Timeout: d}
+	cp.HTTPClient = newHTTPClient(d)
 	return &cp
 }

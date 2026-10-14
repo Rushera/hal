@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -611,5 +612,107 @@ func TestSwitchingWhileRunningIsNotReportedAsAFailure(t *testing.T) {
 	}
 	if !strings.Contains(view, "switched session") {
 		t.Fatalf("the switch should still be reported:\n%s", view)
+	}
+}
+
+func TestPickerScrollsAndKeepsItsLayout(t *testing.T) {
+	fa := &fakeAgent{}
+	m, _ := newTestModel(t, fa)
+	var infos []session.Info
+	for i := 0; i < pickerMax+5; i++ {
+		infos = append(infos, sessionEntry(fmt.Sprintf("id%011d", i), fmt.Sprintf("task %d", i)))
+	}
+	m = withSessions(m, "current0", infos...)
+
+	m, _ = typeAndEnter(t, m, "/switch")
+	if !m.picking {
+		t.Fatal("the picker should open with many sessions")
+	}
+	// A window is shown, not the whole list.
+	view := m.View()
+	if strings.Contains(view, "task 12") {
+		t.Fatalf("the picker should not show every entry:\n%s", view)
+	}
+	if !strings.Contains(view, "task 0") {
+		t.Fatalf("the first entries should be visible:\n%s", view)
+	}
+	if !strings.Contains(view, fmt.Sprintf("1–%d of %d", pickerMax, len(infos))) {
+		t.Fatalf("the window should be summarised:\n%s", view)
+	}
+
+	// Walk to the end; the window must follow the selection and stay bounded.
+	for i := 0; i < len(infos)-1; i++ {
+		m = press(t, m, "j")
+	}
+	if m.selected != len(infos)-1 {
+		t.Fatalf("selected = %d, want the last entry", m.selected)
+	}
+	view = m.View()
+	if !strings.Contains(view, fmt.Sprintf("task %d", len(infos)-1)) {
+		t.Fatalf("the selected entry should be visible:\n%s", view)
+	}
+	if !strings.Contains(view, fmt.Sprintf("%d–%d of %d", len(infos)-pickerMax+1, len(infos), len(infos))) {
+		t.Fatalf("the window should have scrolled:\n%s", view)
+	}
+
+	// The layout reserves room for the picker: it must never exceed the terminal.
+	lines := strings.Count(m.View(), "\n") + 1
+	if lines > 40 {
+		t.Fatalf("the view overflowed the terminal (%d lines):\n%s", lines, m.View())
+	}
+}
+
+func TestPickerDigitShortcutSelects(t *testing.T) {
+	fa := &fakeAgent{}
+	m, _ := newTestModel(t, fa)
+	m = withSessions(m, "current0",
+		sessionEntry("aaaa000011112222", "one"),
+		sessionEntry("bbbb111122223333", "two"),
+		sessionEntry("cccc222233334444", "three"))
+
+	m, _ = typeAndEnter(t, m, "/switch")
+	m = press(t, m, "3")
+	if m.picking {
+		t.Fatal("a digit should select immediately")
+	}
+	if got := m.sessionID(); got != "cccc222233334444" {
+		t.Fatalf("digit 3 should pick the third entry, got %q", got)
+	}
+}
+
+func TestPickerIgnoresDigitsPastTheList(t *testing.T) {
+	fa := &fakeAgent{}
+	m, _ := newTestModel(t, fa)
+	m = withSessions(m, "current0", sessionEntry("aaaa000011112222", "one"))
+
+	m, _ = typeAndEnter(t, m, "/switch")
+	m = press(t, m, "9")
+	if !m.picking {
+		t.Fatal("a digit past the end must not select anything")
+	}
+	if got := m.sessionID(); got != "current0" {
+		t.Fatalf("session changed to %q", got)
+	}
+}
+
+func TestPickerAtASmallTerminalStaysUsable(t *testing.T) {
+	fa := &fakeAgent{}
+	m := New(Options{Agent: fa, Cwd: "/work", Version: "test"})
+	var tm tea.Model = m
+	tm, _ = tm.Update(tea.WindowSizeMsg{Width: 40, Height: 12})
+	m = tm.(*Model)
+	var infos []session.Info
+	for i := 0; i < pickerMax+3; i++ {
+		infos = append(infos, sessionEntry(fmt.Sprintf("id%011d", i), fmt.Sprintf("t%d", i)))
+	}
+	m = withSessions(m, "current0", infos...)
+
+	m, _ = typeAndEnter(t, m, "/switch")
+	view := m.View()
+	if !strings.Contains(view, "switch session") {
+		t.Fatalf("the picker should render on a small terminal:\n%s", view)
+	}
+	if lines := strings.Count(view, "\n") + 1; lines > 12 {
+		t.Fatalf("the view overflowed a 12-line terminal (%d lines):\n%s", lines, view)
 	}
 }

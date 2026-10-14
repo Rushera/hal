@@ -1,11 +1,13 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Rushera/hal/internal/agent"
 	"github.com/Rushera/hal/internal/config"
@@ -466,4 +468,87 @@ func hasSetting(sources []settingSource, key, origin string) bool {
 		}
 	}
 	return false
+}
+
+// TestNegativeMaxRetriesFromConfig covers the "never retry" setting surviving a
+// config-file round trip, which the 0-means-default rule could easily swallow.
+func TestNegativeMaxRetriesFromConfig(t *testing.T) {
+	_, cfgHome, _ := isolateXDG(t)
+	writeConfig(t, cfgHome, "config.toml", "max_retries = -1\n")
+
+	cfg, err := config.Load("", config.Resolve())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.File.MaxRetries != -1 {
+		t.Fatalf("config parsed max_retries = %d, want -1", cfg.File.MaxRetries)
+	}
+	o, set, err := parseArgs(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, sources := resolveOptions(o, set, cfg)
+	if resolved.maxRetries != -1 {
+		t.Fatalf("resolved max retries = %d, want -1", resolved.maxRetries)
+	}
+	if !hasSetting(sources, "max_retries", "config") {
+		t.Fatalf("source not reported: %+v", sources)
+	}
+}
+
+// TestContinueAllIsOverriddenByExplicitSession pins the precedence between the
+// ways of choosing a session: an explicit --session wins over --continue-all,
+// and both are independent of -c.
+func TestContinueAllIsOverriddenByExplicitSession(t *testing.T) {
+	_, cfgHome, _ := isolateXDG(t)
+	workdir := t.TempDir()
+	mock := newMockServer(t, [][]string{textChunks("ok")})
+	writeConfig(t, cfgHome, "config.toml", `
+model = "m"
+base_url = "`+mock.server.URL+`"
+api_key = "k"
+`)
+
+	// Two sessions: the newest anywhere, and an older explicit one.
+	other := t.TempDir()
+	older, err := session.New(session.RootWith(""), other, "older", "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = older.AppendMessage(agent.NewUserMessage("OLDER MARKER"))
+	_ = older.Close()
+	time.Sleep(10 * time.Millisecond)
+
+	newer, err := session.New(session.RootWith(""), other, "newer", "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = newer.AppendMessage(agent.NewUserMessage("NEWER MARKER"))
+	_ = newer.Close()
+
+	oldWd, _ := os.Getwd()
+	if err := os.Chdir(workdir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldWd)
+
+	if _, err := captureStdout(t, func() error {
+		return runWithArgs([]string{"--continue-all", "--session", older.Path, "-p", "go on"})
+	}); err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	msgs, _ := mock.requests[0]["messages"].([]any)
+	var carried []string
+	for _, raw := range msgs {
+		if m, ok := raw.(map[string]any); ok {
+			carried = append(carried, fmt.Sprint(m["content"]))
+		}
+	}
+	joined := strings.Join(carried, "\n")
+	if !strings.Contains(joined, "OLDER MARKER") {
+		t.Fatalf("--session should win over --continue-all: %v", carried)
+	}
+	if strings.Contains(joined, "NEWER MARKER") {
+		t.Fatalf("the newest session must not be used: %v", carried)
+	}
 }
