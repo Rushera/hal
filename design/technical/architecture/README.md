@@ -439,3 +439,9 @@ fixed at seven, one provider protocol is packaged, and the four interfaces are
 the supported ones. Anything beyond that — extensions, sub-agents, MCP, other
 vendors — is out of scope until a design document says otherwise, not something
 to be added as a local convenience.
+
+One proposed feature already needs all four seams at once, and is described in
+`design/features/context-management`: a context-window indicator and compaction.
+It is not implemented, and its technical design (limit discovery, the estimate,
+the threshold check in the loop, the compaction entry in the session format) is
+not written yet, so nothing about it should appear in the code until both exist.

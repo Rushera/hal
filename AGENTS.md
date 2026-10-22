@@ -62,6 +62,7 @@ built" never mix:
 design/README.md          index of the design docs and the folder conventions
 design/features/          what hal does — one folder per feature item
   basic-functions/        the current feature set, described coarse to fine
+  context-management/     proposed: context indicator and compaction
 design/technical/         how hal is built — one folder per technical item
   architecture/           the current technical architecture
 ```
@@ -89,6 +90,10 @@ are never merged into one folder.
 - **Design changes are not commits the agent makes.** An agent may propose a
   design change in prose or in the task's response; writing it into `design/`
   is the developer's job.
+- **A proposed document is not a licence to build.** An item marked *proposed* or
+  *not written yet* describes work the developer has not approved. The feature is
+  implemented only after the developer says so, and only once the technical
+  document it depends on exists too.
 
 Because hal itself loads `AGENTS.md` (and `CLAUDE.md`) as context files, this
 file is also the instruction set an agent run by hal reads from its own working
